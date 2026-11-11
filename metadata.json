@@ -1,0 +1,6 @@
+{
+  "name": "D&D 5e - Monde Indifférent",
+  "description": "Simulation déterministe D&D 5e et univers persistant indépendant du joueur.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
