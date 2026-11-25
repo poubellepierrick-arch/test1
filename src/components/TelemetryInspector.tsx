@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { SimulationState } from '../types';
-import { Terminal, Database, Cpu, Eye, EyeOff, Layers, ShieldAlert } from 'lucide-react';
+import { obtenirPnjsEnVue } from '../engine/encounters';
+import { Terminal, Database, Cpu, Eye, EyeOff, Layers, ShieldAlert, Brain } from 'lucide-react';
 
 interface TelemetryInspectorProps {
   etat: SimulationState;
@@ -8,7 +9,7 @@ interface TelemetryInspectorProps {
 
 export const TelemetryInspector: React.FC<TelemetryInspectorProps> = ({ etat }) => {
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
-  const [sousOnglet, setSousOnglet] = useState<'traces' | 'donnees_monde'>('traces');
+  const [sousOnglet, setSousOnglet] = useState<'traces' | 'donnees_monde' | 'cerveau_mj'>('traces');
 
   const traces = etat.historiqueTraces || [];
   const derniereTrace = traces.length > 0 ? traces[traces.length - 1] : null;
@@ -31,10 +32,10 @@ export const TelemetryInspector: React.FC<TelemetryInspectorProps> = ({ etat }) 
         </div>
 
         {/* Sous-onglets */}
-        <div className="flex items-center gap-1 bg-stone-100 p-1 rounded-md text-[11px]">
+        <div className="flex flex-wrap items-center gap-1 bg-stone-100 p-1 rounded-md text-[11px]">
           <button
             onClick={() => setSousOnglet('traces')}
-            className={`px-3 py-1 rounded transition-colors font-medium ${
+            className={`px-3 py-1 rounded transition-colors font-medium cursor-pointer ${
               sousOnglet === 'traces'
                 ? 'bg-white text-stone-900 shadow-2xs'
                 : 'text-stone-600 hover:text-stone-900'
@@ -44,13 +45,24 @@ export const TelemetryInspector: React.FC<TelemetryInspectorProps> = ({ etat }) 
           </button>
           <button
             onClick={() => setSousOnglet('donnees_monde')}
-            className={`px-3 py-1 rounded transition-colors font-medium ${
+            className={`px-3 py-1 rounded transition-colors font-medium cursor-pointer ${
               sousOnglet === 'donnees_monde'
                 ? 'bg-white text-stone-900 shadow-2xs'
                 : 'text-stone-600 hover:text-stone-900'
             }`}
           >
             Données du monde (utilisées vs filtrées)
+          </button>
+          <button
+            onClick={() => setSousOnglet('cerveau_mj')}
+            className={`px-3 py-1 rounded transition-colors font-medium flex items-center gap-1 cursor-pointer ${
+              sousOnglet === 'cerveau_mj'
+                ? 'bg-white text-stone-900 shadow-2xs'
+                : 'text-stone-600 hover:text-stone-900'
+            }`}
+          >
+            <Brain className="w-3.5 h-3.5 text-amber-700" />
+            Cerveau & Mémoire MJ
           </button>
         </div>
       </div>
@@ -105,9 +117,47 @@ export const TelemetryInspector: React.FC<TelemetryInspectorProps> = ({ etat }) 
                     </span>
                   </div>
                   <span className="text-[11px] text-stone-500 font-mono">
-                    Modèle : <strong>{traceActive.modeleIa}</strong> ({traceActive.latenceMs} ms)
+                    Modèle : <strong>{traceActive.modeleIa}</strong>
+                    {traceActive.niveauReflexion ? ` · Réflexion ${traceActive.niveauReflexion}` : ''} ({traceActive.latenceMs} ms)
                   </span>
                 </div>
+
+                {(traceActive.motifReflexion || traceActive.rapportCoherence || (traceActive.notesSecretesTour && traceActive.notesSecretesTour.length > 0)) && (
+                  <div className="bg-amber-50/70 border border-amber-200 p-2.5 rounded-md space-y-1 text-[11px]">
+                    {traceActive.motifReflexion && (
+                      <div className="text-stone-700">
+                        <strong>Motif :</strong> {traceActive.motifReflexion}
+                      </div>
+                    )}
+                    {traceActive.rapportCoherence && (
+                      <div className="text-stone-700">
+                        <strong>Audit cohérence :</strong> {traceActive.rapportCoherence.statut}
+                        {traceActive.rapportCoherence.corrections.length > 0 && ` · Corrections : ${traceActive.rapportCoherence.corrections.join(' ; ')}`}
+                        {traceActive.rapportCoherence.anomalies.length > 0 && ` · Anomalies : ${traceActive.rapportCoherence.anomalies.join(' ; ')}`}
+                      </div>
+                    )}
+                    {traceActive.notesSecretesTour && traceActive.notesSecretesTour.length > 0 && (
+                      <div className="text-stone-700">
+                        <strong>Notes secrètes du tour :</strong> {traceActive.notesSecretesTour.join(' | ')}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {traceActive.appelsOutils && traceActive.appelsOutils.length > 0 && (
+                  <div className="bg-white border border-stone-200 p-2.5 rounded-md space-y-1">
+                    <span className="text-[10px] text-stone-500 uppercase font-bold block">
+                      Outils orchestrés par le MJ ({traceActive.appelsOutils.length}) :
+                    </span>
+                    <div className="space-y-1">
+                      {traceActive.appelsOutils.map((outil, idx) => (
+                        <div key={idx} className="text-[11px] font-mono text-stone-700 border-t border-stone-100 pt-1">
+                          <strong className="text-emerald-800">{outil.nom}</strong> → {outil.resultat}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* Formule mathématique */}
                 {traceActive.donneesUtilisees.formuleMathematique && (
@@ -145,6 +195,18 @@ export const TelemetryInspector: React.FC<TelemetryInspectorProps> = ({ etat }) 
                     </ul>
                   </div>
                 </div>
+
+                {traceActive.donneesUtilisees.fichesSrdConsultees &&
+                  traceActive.donneesUtilisees.fichesSrdConsultees.length > 0 && (
+                    <div className="bg-white p-2.5 rounded-md border border-stone-200">
+                      <span className="text-amber-800 uppercase text-[10px] font-bold block mb-1">
+                        Fiches Compendium SRD 5e mobilisées ({traceActive.donneesUtilisees.fichesSrdConsultees.length}) :
+                      </span>
+                      <div className="text-[11px] font-mono text-stone-700">
+                        {traceActive.donneesUtilisees.fichesSrdConsultees.join(' · ')}
+                      </div>
+                    </div>
+                  )}
 
                 {/* Filtrage Boundary-Aware Graphe */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
@@ -221,7 +283,7 @@ export const TelemetryInspector: React.FC<TelemetryInspectorProps> = ({ etat }) 
             )}
           </div>
         </div>
-      ) : (
+      ) : sousOnglet === 'donnees_monde' ? (
         /* Données du monde */
         <div className="space-y-4">
           <div className="text-xs text-stone-600">
@@ -306,17 +368,22 @@ export const TelemetryInspector: React.FC<TelemetryInspectorProps> = ({ etat }) 
                 <span>Ontologie graphe GraphRAG ({etat.grapheNoeuds.length} Nœuds, {etat.grapheLiens.length} Liens)</span>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1">
-                {etat.grapheNoeuds.map(noeud => {
-                  const estInjecte = noeud.type === 'Location' || noeud.id === 'npc_forgeron_torvin' || noeud.connuParEntites?.includes('hex_0000_bourgade');
-                  return (
-                    <div
-                      key={noeud.id}
-                      className={`p-2 rounded-md border text-xs flex items-center justify-between ${
-                        estInjecte
-                          ? 'bg-white border-emerald-300 text-stone-900'
-                          : 'bg-white/60 border-stone-200 text-stone-500'
-                      }`}
-                    >
+                {(() => {
+                  const pnjsEnVueIds = new Set(obtenirPnjsEnVue(etat).map(p => p.id));
+                  return etat.grapheNoeuds.map(noeud => {
+                    const estInjecte =
+                      noeud.type === 'Location' ||
+                      pnjsEnVueIds.has(noeud.id) ||
+                      noeud.connuParEntites?.includes(etat.hexActuel.id);
+                    return (
+                      <div
+                        key={noeud.id}
+                        className={`p-2 rounded-md border text-xs flex items-center justify-between ${
+                          estInjecte
+                            ? 'bg-white border-emerald-300 text-stone-900'
+                            : 'bg-white/60 border-stone-200 text-stone-500'
+                        }`}
+                      >
                       <div className="space-y-0.5 max-w-[70%]">
                         <div className="font-bold flex items-center gap-1.5">
                           <span>{noeud.label}</span>
@@ -338,11 +405,205 @@ export const TelemetryInspector: React.FC<TelemetryInspectorProps> = ({ etat }) 
                       </span>
                     </div>
                   );
-                })}
+                });
+                })()}
+              </div>
+            </div>
+
+            {/* Unités & Chronique du monde */}
+            <div className="bg-stone-50 border border-stone-200 rounded-lg p-3 space-y-2 md:col-span-2">
+              <div className="flex items-center justify-between text-stone-900 font-bold border-b border-stone-200 pb-1.5">
+                <span>Monde autonome</span>
+                <span className="text-[11px] font-mono text-stone-500 font-normal">
+                  {(etat.entitesMonde || []).filter(e => e.statut === 'EN_ROUTE').length} unité(s) · {(etat.chroniqueMonde || []).length} chronique(s)
+                </span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px]">
+                <div className="space-y-1">
+                  {(etat.entitesMonde || []).filter(e => e.statut === 'EN_ROUTE').map(e => (
+                    <div key={e.id} className="bg-white border border-stone-200 px-2.5 py-1.5 rounded flex justify-between">
+                      <span className="font-semibold text-stone-800">{e.nom} ({e.type})</span>
+                      <span className="font-mono text-stone-500">{e.hexId} → {e.destinationHexId}</span>
+                    </div>
+                  ))}
+                  {(etat.entitesMonde || []).filter(e => e.statut === 'EN_ROUTE').length === 0 && (
+                    <div className="text-stone-400">Aucune unité en route.</div>
+                  )}
+                </div>
+                <div className="space-y-1">
+                  {(etat.chroniqueMonde || []).slice(0, 4).map(c => (
+                    <div key={c.id} className="bg-white border border-stone-200 px-2.5 py-1.5 rounded flex justify-between gap-2">
+                      <span className="font-medium text-stone-800 truncate">{c.titre}</span>
+                      <span className="font-mono text-stone-500 shrink-0">J{c.jour} · T{c.tick}</span>
+                    </div>
+                  ))}
+                  {(etat.chroniqueMonde || []).length === 0 && (
+                    <div className="text-stone-400">Chronique vide.</div>
+                  )}
+                </div>
               </div>
             </div>
           </div>
         </div>
+      ) : (
+        /* Cerveau & Mémoire MJ : Transparence complète des coulisses */
+        (() => {
+          const mem = etat.memoireMJ;
+          const pnjs = etat.grapheNoeuds.filter(n => n.type === 'Actor');
+          const dernierAudit = [...traces].reverse().find(t => t.rapportCoherence)?.rapportCoherence;
+
+          return (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-stone-600">
+                <span>État interne du Maître du Jeu : mémoire condensée, arcs, secrets PNJ et notes cachées.</span>
+                <span className="font-mono text-[11px] text-stone-500">
+                  Modèle : <strong>Gemini 4 Hydrogen {etat.profilHydrogen === 'MAX' ? 'Max' : 'Standard'}</strong> · Narration : <strong>{etat.modeNarration || 'CONCIS'}</strong>
+                  {etat.jetEnAttente ? ` · Jet en attente : ${etat.jetEnAttente.competence || etat.jetEnAttente.caracteristique} DD ${etat.jetEnAttente.dd}` : ''}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* Chronique condensée & Fil récent */}
+                <div className="bg-stone-50 border border-stone-200 rounded-lg p-3 space-y-2">
+                  <div className="font-bold text-stone-900 border-b border-stone-200 pb-1.5">
+                    Mémoire de campagne
+                  </div>
+                  {mem?.chroniqueCondensee && (
+                    <div className="bg-white border border-stone-200 rounded p-2 text-[11px] space-y-1">
+                      <div className="font-semibold text-amber-800 text-[10px] uppercase">Chronique condensée</div>
+                      <div className="whitespace-pre-wrap text-stone-700 leading-relaxed">{mem.chroniqueCondensee}</div>
+                    </div>
+                  )}
+                  <div className="space-y-1 max-h-48 overflow-y-auto">
+                    {(mem?.filNarratif || []).length === 0 ? (
+                      <div className="text-stone-400">Aucun événement mémorisé.</div>
+                    ) : (
+                      mem!.filNarratif.map((ligne, idx) => (
+                        <div key={idx} className="bg-white border border-stone-200 rounded px-2 py-1 text-[11px] text-stone-700">
+                          {ligne}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* Journal secret du MJ */}
+                <div className="bg-stone-50 border border-stone-200 rounded-lg p-3 space-y-2">
+                  <div className="font-bold text-stone-900 border-b border-stone-200 pb-1.5">
+                    Notes secrètes du MJ ({mem?.journalSecretMJ?.length || 0})
+                  </div>
+                  <div className="space-y-1.5 max-h-60 overflow-y-auto">
+                    {(mem?.journalSecretMJ || []).length === 0 ? (
+                      <div className="text-stone-400">Aucune note secrète enregistrée.</div>
+                    ) : (
+                      mem!.journalSecretMJ!.slice().reverse().map(n => (
+                        <div key={n.id} className="bg-white border border-amber-200 rounded p-2 space-y-0.5 text-[11px]">
+                          <div className="flex justify-between font-semibold text-stone-900">
+                            <span>{n.titre}</span>
+                            <span className="font-mono text-[10px] text-stone-400">J{n.jour}</span>
+                          </div>
+                          <div className="text-stone-700">{n.contenu}</div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* Arcs narratifs */}
+                <div className="bg-stone-50 border border-stone-200 rounded-lg p-3 space-y-2">
+                  <div className="font-bold text-stone-900 border-b border-stone-200 pb-1.5">
+                    Arcs narratifs ({mem?.arcsNarratifs?.length || 0})
+                  </div>
+                  <div className="space-y-1.5 max-h-56 overflow-y-auto">
+                    {(mem?.arcsNarratifs || []).length === 0 ? (
+                      <div className="text-stone-400">Aucun arc actif.</div>
+                    ) : (
+                      mem!.arcsNarratifs!.map(a => (
+                        <div key={a.id} className="bg-white border border-stone-200 rounded p-2 space-y-1 text-[11px]">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-bold text-stone-900">{a.titre}</span>
+                            <span className="font-mono text-[10px] text-amber-800">{a.statut} · {a.progression}%</span>
+                          </div>
+                          {a.resume && (
+                            <div className="text-stone-600">{a.resume}</div>
+                          )}
+                          {(a.acteursLies || []).length > 0 && (
+                            <div className="text-[10px] text-stone-500">Acteurs : {(a.acteursLies || []).join(', ')}</div>
+                          )}
+                          {a.prochaineEtape && (
+                            <div className="text-stone-700">Suite : {a.prochaineEtape}</div>
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* Conséquences différées & Dernier audit */}
+                <div className="bg-stone-50 border border-stone-200 rounded-lg p-3 space-y-2">
+                  <div className="font-bold text-stone-900 border-b border-stone-200 pb-1.5">
+                    Conséquences différées & Cohérence
+                  </div>
+                  {dernierAudit && (
+                    <div className="bg-white border border-stone-200 rounded p-2 text-[11px] space-y-0.5">
+                      <div className="font-semibold text-stone-900">
+                        Dernier audit : {dernierAudit.statut}
+                      </div>
+                      {dernierAudit.corrections.map((c, i) => (
+                        <div key={`dc-${i}`} className="text-amber-800">Corrigé : {c}</div>
+                      ))}
+                      {dernierAudit.anomalies.map((a, i) => (
+                        <div key={`da-${i}`} className="text-rose-800">Anomalie : {a}</div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="space-y-1 max-h-44 overflow-y-auto">
+                    {(mem?.consequencesDifferees || []).length === 0 ? (
+                      <div className="text-stone-400">Aucune conséquence différée.</div>
+                    ) : (
+                      mem!.consequencesDifferees.map(c => (
+                        <div key={c.id} className="bg-white border border-stone-200 rounded p-2 text-[11px]">
+                          <div className="flex justify-between font-semibold text-stone-800">
+                            <span>{c.declencheur}</span>
+                            <span className="font-mono text-[10px] text-stone-500">{c.actif ? 'ACTIF' : 'RÉSOLU'}</span>
+                          </div>
+                          <div className="text-stone-600">{c.effetPrevu}</div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* PNJ Secrets & Dispositions */}
+                <div className="bg-stone-50 border border-stone-200 rounded-lg p-3 space-y-2 md:col-span-2">
+                  <div className="font-bold text-stone-900 border-b border-stone-200 pb-1.5">
+                    PNJ : dispositions, motivations & secrets ({pnjs.length})
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-60 overflow-y-auto">
+                    {pnjs.map(p => (
+                      <div key={p.id} className="bg-white border border-stone-200 rounded p-2 text-[11px] space-y-0.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-bold text-stone-900">
+                            {p.label} ({p.proprietes?.profession || 'PNJ'})
+                          </span>
+                          <span className="font-mono text-[10px] text-stone-500">
+                            {p.proprietes?.disposition || 'NEUTRE'} · {p.proprietes?.hexId || 'Secteur'}
+                          </span>
+                        </div>
+                        {p.proprietes?.motivation && (
+                          <div className="text-stone-700">Motivation : {p.proprietes.motivation}</div>
+                        )}
+                        {p.proprietes?.secret && (
+                          <div className="text-amber-900">Secret : {p.proprietes.secret}</div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()
       )}
     </div>
   );

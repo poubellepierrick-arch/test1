@@ -1,0 +1,128 @@
+{
+  "entities": {
+    "CampaignSave": {
+      "title": "CampaignSave",
+      "description": "Sauvegarde complète d'une campagne D&D 5e avec empreinte d'intégrité pour réplication entre base principale et base de secours.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Identifiant UID Firebase du propriétaire.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "campaignId": {
+          "type": "string",
+          "description": "Identifiant de la campagne sauvegardée.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "description": "Version du format de sauvegarde."
+        },
+        "seq": {
+          "type": "integer",
+          "description": "Compteur de séquence de simulation."
+        },
+        "checksum": {
+          "type": "string",
+          "description": "Empreinte d'intégrité FNV-1a de l'état de simulation.",
+          "minLength": 4,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "sourceKind": {
+          "type": "string",
+          "description": "Rôle de la base cible.",
+          "enum": ["primary", "backup_mirror"],
+          "maxLength": 20
+        },
+        "characterName": {
+          "type": "string",
+          "description": "Nom du personnage principal.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "day": {
+          "type": "integer",
+          "description": "Jour courant en jeu."
+        },
+        "simulationState": {
+          "type": "object",
+          "description": "État natif complet de la simulation D&D 5e (maps et listes Firestore)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Horodatage serveur de création."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Horodatage serveur de dernière mise à jour."
+        }
+      },
+      "required": [
+        "ownerId",
+        "campaignId",
+        "schemaVersion",
+        "seq",
+        "checksum",
+        "sourceKind",
+        "characterName",
+        "day",
+        "simulationState",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserMeta": {
+      "title": "UserMeta",
+      "description": "Métadonnées publiques minimales de synchronisation (sans PII).",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Identifiant UID Firebase du joueur.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Nom affiché dans la session.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "lastBackupSeq": {
+          "type": "integer",
+          "description": "Dernier numéro de séquence copié vers la base de secours."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Horodatage serveur de création."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Horodatage serveur de mise à jour."
+        }
+      },
+      "required": ["ownerId", "displayName", "lastBackupSeq", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/campaigns/{campaignId}": {
+      "schema": { "$ref": "#/entities/CampaignSave" },
+      "description": "Sauvegarde de campagne isolée par propriétaire, dupliquée entre base principale et base miroir."
+    },
+    "/users/{userId}/meta/{metaId}": {
+      "schema": { "$ref": "#/entities/UserMeta" },
+      "description": "État de synchronisation de sauvegarde pour l'utilisateur propriétaire."
+    }
+  }
+}

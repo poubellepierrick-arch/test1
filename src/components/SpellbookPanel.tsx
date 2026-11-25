@@ -1,8 +1,8 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { CharacterStats, CombatState } from '../types';
 import { ActionRequest } from '../engine/adjudication';
 import { BookOpen, Sparkles, Flame, Shield, Heart, Eye, Wind } from 'lucide-react';
-import { calculerSortsPreparesMax } from '../engine/spells';
+import { calculerSortsPreparesMax, obtenirCatalogueSortsComplet } from '../engine/spells';
 
 interface SpellbookPanelProps {
   personnage: CharacterStats;
@@ -17,7 +17,8 @@ export const SpellbookPanel: React.FC<SpellbookPanelProps> = ({
   chargement,
   onExecuterAction,
 }) => {
-  const sortsConnus = personnage.sortsConnus || [];
+  const [voirCatalogueSrd, setVoirCatalogueSrd] = useState(false);
+  const sortsConnus = voirCatalogueSrd ? obtenirCatalogueSortsComplet() : (personnage.sortsConnus || []);
   const sortsPrepares = personnage.sortsPrepares || [];
   const maxPrepares = calculerSortsPreparesMax(personnage);
 
@@ -53,10 +54,23 @@ export const SpellbookPanel: React.FC<SpellbookPanelProps> = ({
       <div className="flex items-center justify-between border-b border-stone-100 pb-1.5 text-stone-700">
         <div className="flex items-center gap-1.5 font-bold text-stone-900">
           <BookOpen className="w-4 h-4 text-indigo-700" />
-          <span>Grimoire de terrain & rituels</span>
+          <span>{voirCatalogueSrd ? 'Catalogue sorts 5e' : 'Grimoire'}</span>
         </div>
-        <div className="text-[11px] text-stone-500 font-mono">
-          Préparés : <strong className="text-indigo-900">{sortsPrepares.length}</strong> / {maxPrepares} max
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setVoirCatalogueSrd(v => !v)}
+            className={`px-2 py-0.5 rounded text-[10px] font-medium border transition-colors ${
+              voirCatalogueSrd
+                ? 'bg-indigo-700 text-white border-indigo-700'
+                : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-50'
+            }`}
+          >
+            {voirCatalogueSrd ? 'Grimoire' : 'Codex sorts'}
+          </button>
+          <span className="text-[11px] text-stone-500 font-mono">
+            Prêts : <strong className="text-indigo-900">{sortsPrepares.length}</strong> / {maxPrepares}
+          </span>
         </div>
       </div>
 

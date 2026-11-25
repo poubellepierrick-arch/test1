@@ -1,16 +1,23 @@
 import React, { useState } from 'react';
 import { CharacterStats } from '../types';
 import { ActionRequest } from '../engine/adjudication';
-import { Users, Shield, Package, Trash2, Heart } from 'lucide-react';
+import { RecrueType } from '../engine/context';
+import { Users, Package, Trash2, Heart } from 'lucide-react';
 
 interface HirelingsPanelProps {
   personnage: CharacterStats;
+  recruesDisponiblesTypes?: RecrueType[];
+  peutEmbaucher?: boolean;
+  raisonCompagnons?: string;
   chargement: boolean;
   onExecuterAction: (action: ActionRequest) => void;
 }
 
 export const HirelingsPanel: React.FC<HirelingsPanelProps> = ({
   personnage,
+  recruesDisponiblesTypes = ['MULET', 'PORTEUR', 'MERCENAIRE'],
+  peutEmbaucher = true,
+  raisonCompagnons = 'Bourgade ou fort requis',
   chargement,
   onExecuterAction,
 }) => {
@@ -19,29 +26,32 @@ export const HirelingsPanel: React.FC<HirelingsPanelProps> = ({
   const recruesDisponibles = [
     {
       type: 'MULET' as const,
-      nom: 'Mulet de bât robuste',
-      coutPA: 2,
-      chargeLbs: 150,
+      nom: 'Mulet de bât',
+      coutPA: 15,
+      coutJourPA: 3,
+      chargeLbs: 200,
       pv: 11,
-      desc: '+150 lbs de charge utile. Docile mais refuse le combat.',
+      desc: '+200 lbs de charge. Refuse le combat.',
     },
     {
       type: 'PORTEUR' as const,
-      nom: 'Porteur de hotte',
-      coutPA: 4,
-      chargeLbs: 60,
-      pv: 8,
-      desc: '+60 lbs de portage. Aide aux feux et corvées de camp.',
+      nom: 'Porteur journalier',
+      coutPA: 10,
+      coutJourPA: 4,
+      chargeLbs: 100,
+      pv: 9,
+      desc: '+100 lbs de charge. Aide au camp.',
     },
     {
       type: 'MERCENAIRE' as const,
       nom: "Mercenaire d'appoint",
-      coutPA: 10,
-      chargeLbs: 30,
-      pv: 12,
-      desc: 'Combattant avec hache (1d8). Partage la garde nocturne.',
+      coutPA: 25,
+      coutJourPA: 8,
+      chargeLbs: 60,
+      pv: 13,
+      desc: 'Combat (+3 att) et garde nocturne.',
     },
-  ];
+  ].filter(r => recruesDisponiblesTypes.includes(r.type));
 
   const engager = (recrue: (typeof recruesDisponibles)[0]) => {
     onExecuterAction({
@@ -70,14 +80,14 @@ export const HirelingsPanel: React.FC<HirelingsPanelProps> = ({
   return (
     <div className="space-y-3 text-xs">
       <div className="flex items-center justify-between text-stone-500 text-[11px]">
-        <span className="font-semibold uppercase tracking-wide">Compagnons & bêtes de somme</span>
-        <span className="font-mono text-stone-700 font-semibold">{compagnonsActifs.length} engagé(s)</span>
+        <span className="font-semibold uppercase tracking-wide">Compagnons & bêtes</span>
+        <span className="font-mono text-stone-700 font-semibold">{compagnonsActifs.length} actif(s)</span>
       </div>
 
       {/* Confirmation de renvoi en ligne */}
       {confirmationRenvoi && (
         <div className="bg-amber-50 border border-amber-300 p-2.5 rounded-lg flex items-center justify-between">
-          <span className="text-xs text-amber-900 font-medium">Libérer ce compagnon de son contrat ?</span>
+          <span className="text-xs text-amber-900 font-medium">Congédier ce compagnon ?</span>
           <div className="flex items-center gap-2">
             <button
               onClick={() => licencier(confirmationRenvoi)}
@@ -128,7 +138,7 @@ export const HirelingsPanel: React.FC<HirelingsPanelProps> = ({
                 onClick={() => setConfirmationRenvoi(comp.id)}
                 disabled={chargement}
                 className="p-1.5 text-stone-400 hover:text-rose-700 transition-colors"
-                title="Renvoyer ce compagnon"
+                title="Congédier"
               >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
@@ -139,31 +149,37 @@ export const HirelingsPanel: React.FC<HirelingsPanelProps> = ({
 
       {/* Recrutement disponible */}
       <div className="space-y-1.5">
-        <div className="text-[11px] text-stone-500 font-semibold uppercase">Contrats disponibles au camp</div>
-        <div className="grid grid-cols-1 gap-2">
-          {recruesDisponibles.map(recrue => (
-            <div
-              key={recrue.type}
-              className="bg-stone-50 border border-stone-200 p-2.5 rounded-lg flex items-center justify-between"
-            >
-              <div>
-                <div className="font-bold text-stone-900">{recrue.nom}</div>
-                <div className="text-[11px] text-stone-500">{recrue.desc}</div>
-                <div className="text-[10px] text-stone-400 font-mono mt-0.5">
-                  Coût d'embauche : {recrue.coutPA} PA/jour
-                </div>
-              </div>
-
-              <button
-                onClick={() => engager(recrue)}
-                disabled={chargement || soldePA < recrue.coutPA}
-                className="px-3 py-1 bg-purple-700 hover:bg-purple-800 disabled:opacity-40 text-white rounded font-medium text-[11px] shadow-2xs transition-colors shrink-0 ml-2"
+        <div className="text-[11px] text-stone-500 font-semibold uppercase">Embauche</div>
+        {!peutEmbaucher || recruesDisponibles.length === 0 ? (
+          <div className="bg-stone-50 border border-stone-200 rounded-lg p-2.5 text-stone-500">
+            Recrutement indisponible : {raisonCompagnons}.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-2">
+            {recruesDisponibles.map(recrue => (
+              <div
+                key={recrue.type}
+                className="bg-stone-50 border border-stone-200 p-2.5 rounded-lg flex items-center justify-between"
               >
-                Engager
-              </button>
-            </div>
-          ))}
-        </div>
+                <div>
+                  <div className="font-bold text-stone-900">{recrue.nom}</div>
+                  <div className="text-[11px] text-stone-500">{recrue.desc}</div>
+                  <div className="text-[10px] text-stone-400 font-mono mt-0.5">
+                    Embauche : {recrue.coutPA} PA · {recrue.coutJourPA} PA/j
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => engager(recrue)}
+                  disabled={chargement || soldePA < recrue.coutPA}
+                  className="px-3 py-1 bg-purple-700 hover:bg-purple-800 disabled:opacity-40 text-white rounded font-medium text-[11px] shadow-2xs transition-colors shrink-0 ml-2"
+                >
+                  Engager
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

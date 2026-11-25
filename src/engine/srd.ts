@@ -164,10 +164,17 @@ export function executerJetSauvegardeMort(personnage: CharacterStats): {
   return { personnageModifie: clone, adjudication };
 }
 
+export interface OptionsRepos {
+  ddCustom?: number;
+  coutPA?: number;
+  mode?: 'auberge' | 'bivouac' | 'porche';
+}
+
 export function executerRepos(
   personnage: CharacterStats,
   type: 'court' | 'long',
-  abriSecurise: boolean = true
+  abriSecurise: boolean = true,
+  options?: OptionsRepos
 ): {
   personnageModifie: CharacterStats;
   adjudication: AdjudicationPayload;
@@ -180,7 +187,6 @@ export function executerRepos(
   if (type === 'court') {
     // Repos court: 1 heure, dépense de dés de vie (simulé: 1d8 + mod CON)
     const modCon = Math.max(0, calculerModificateur(clone.caracteristiques.CON));
-    const jetDv = lancerD20('normal'); // utilisation dé
     const soin = Math.floor(Math.random() * 8) + 1 + modCon;
     pvRecup = Math.min(clone.pvMax - clone.pvActuels, soin);
     clone.pvActuels += pvRecup;
@@ -196,9 +202,27 @@ export function executerRepos(
     desc = `Repos court (1h) : +${pvRecup} PV récupérés. Emplacements de pacte rechargés.`;
   } else {
     // Repos long: 8 heures
+    const coutPA = options?.coutPA || 0;
+    if (coutPA > 0) {
+      const totalPA = clone.monnaies.po * 10 + clone.monnaies.pa;
+      if (totalPA < coutPA) {
+        throw new Error(`Fonds insuffisants pour l'auberge (${coutPA} PA requis).`);
+      }
+      if (clone.monnaies.pa >= coutPA) {
+        clone.monnaies.pa -= coutPA;
+      } else {
+        const reste = coutPA - clone.monnaies.pa;
+        clone.monnaies.pa = 0;
+        const poNecessaires = Math.ceil(reste / 10);
+        clone.monnaies.po -= poNecessaires;
+        clone.monnaies.pa += poNecessaires * 10 - reste;
+      }
+    }
+
     if (!abriSecurise) {
       clone.nuitsConsecutivesSansRepos += 1;
-      const ddSommeil = 10 + (clone.nuitsConsecutivesSansRepos - 1) * 5;
+      const ddBase = options?.ddCustom ?? 10;
+      const ddSommeil = ddBase + (clone.nuitsConsecutivesSansRepos - 1) * 3;
       const jet = lancerD20('normal');
       const modCon = calculerModificateur(clone.caracteristiques.CON);
       const total = jet.valeurRetenue + modCon;
@@ -208,12 +232,17 @@ export function executerRepos(
         if (clone.epuisement >= 6) {
           clone.estMortDefinitivement = true;
         }
-        desc = `Repos interrompu / environnement hostile. Échec JDS CON (${total} vs DD ${ddSommeil}) : +1 épuisement.`;
+        desc = `Bivouac rude (${total} vs DD ${ddSommeil}) : sommeil agité, +1 niveau d'épuisement.`;
       } else {
-        desc = `Repos hostile validé par JDS CON (${total} vs DD ${ddSommeil}).`;
-        // Restauration partielle
+        pvRecup = clone.pvMax - clone.pvActuels;
         clone.pvActuels = clone.pvMax;
-        if (clone.epuisement > 0) clone.epuisement -= 1;
+        if (clone.epuisement > 0) {
+          clone.epuisement -= 1;
+          epuisementRecup = 1;
+        }
+        clone.emplacementsSorts = clone.emplacementsSorts.map(s => ({ ...s, utilise: 0 }));
+        clone.heuresMarcheJour = 0;
+        desc = `Bivouac maîtrisé (${total} vs DD ${ddSommeil}) : PV restaurés et sorts rechargés.`;
       }
     } else {
       clone.nuitsConsecutivesSansRepos = 0;
@@ -223,10 +252,24 @@ export function executerRepos(
         clone.epuisement -= 1;
         epuisementRecup = 1;
       }
+      // En auberge, convalescence accélérée des blessures persistantes
+      if (options?.mode === 'auberge' && clone.blessuresPersistantes?.length) {
+        clone.blessuresPersistantes = clone.blessuresPersistantes
+          .map(b => ({ ...b, joursReposRestants: Math.max(0, b.joursReposRestants - 1) }))
+          .filter(b => {
+            if (b.joursReposRestants === 0 && b.type === 'ENTORSE') {
+              clone.vitessePieds = Math.min(30, clone.vitessePieds + 10);
+            }
+            return b.joursReposRestants > 0;
+          });
+      }
       // Rechargement complet de tous les sorts
       clone.emplacementsSorts = clone.emplacementsSorts.map(s => ({ ...s, utilise: 0 }));
       clone.heuresMarcheJour = 0;
-      desc = `Repos long (8h) complet : PV au maximum, -1 niveau d'épuisement, tous les emplacements de sorts restaurés.`;
+      desc =
+        options?.mode === 'auberge'
+          ? `Nuit à l'auberge (${coutPA} PA) : repos sûr, PV au maximum, sorts restaurés.`
+          : `Repos long (8h) complet : PV au maximum, -1 niveau d'épuisement, tous les emplacements de sorts restaurés.`;
     }
   }
 

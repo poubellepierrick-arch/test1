@@ -1,0 +1,212 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Filet de sécurité global (Global Safety Net)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Fonctions utilitaires durcies
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isSignedIn()
+        && request.auth.uid == userId
+        && request.auth.token.email_verified == true;
+    }
+
+    function isValidSimulationMap(sim) {
+      return sim is map
+        && sim.keys().hasAll([
+          'horloge',
+          'personnage',
+          'hexActuel',
+          'hexagones',
+          'factions',
+          'marche',
+          'journalNarratif'
+        ])
+        && sim.horloge is map
+        && sim.personnage is map
+        && sim.hexActuel is map
+        && sim.hexagones is list
+        && sim.hexagones.size() >= 1
+        && sim.factions is list
+        && sim.marche is map
+        && sim.journalNarratif is list;
+    }
+
+    function isValidCampaignSave(data, userId, campaignId) {
+      return data.keys().hasAll([
+          'ownerId',
+          'campaignId',
+          'schemaVersion',
+          'seq',
+          'checksum',
+          'sourceKind',
+          'characterName',
+          'day',
+          'simulationState',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'campaignId',
+          'schemaVersion',
+          'seq',
+          'checksum',
+          'sourceKind',
+          'characterName',
+          'day',
+          'simulationState',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && isValidId(data.campaignId)
+        && data.campaignId == campaignId
+        && data.schemaVersion is int
+        && data.schemaVersion >= 1
+        && data.schemaVersion <= 100
+        && data.seq is int
+        && data.seq >= 0
+        && data.checksum is string
+        && data.checksum.size() >= 4
+        && data.checksum.size() <= 64
+        && data.checksum.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.sourceKind is string
+        && data.sourceKind.size() <= 20
+        && data.sourceKind in ['primary', 'backup_mirror']
+        && data.characterName is string
+        && data.characterName.size() >= 1
+        && data.characterName.size() <= 80
+        && data.day is int
+        && data.day >= 1
+        && isValidSimulationMap(data.simulationState)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserMeta(data, userId) {
+      return data.keys().hasAll([
+          'ownerId',
+          'displayName',
+          'lastBackupSeq',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'displayName',
+          'lastBackupSeq',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 80
+        && data.lastBackupSeq is int
+        && data.lastBackupSeq >= 0
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Sonde de connectivité au démarrage (lecture seule d'un document spécifique)
+    match /test/{docId} {
+      allow get: if isSignedIn() && isValidId(docId);
+      allow list, create, update, delete: if false;
+    }
+
+    // Sauvegardes de campagne (base principale & base de secours miroir)
+    match /users/{userId}/campaigns/{campaignId} {
+      allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(campaignId);
+      allow list: if isVerifiedOwner(userId) && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(campaignId)
+        && isValidCampaignSave(incoming(), userId, campaignId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(campaignId)
+        && isValidCampaignSave(incoming(), userId, campaignId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().campaignId == existing().campaignId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action : Synchronisation d'état ou réplication vers secours
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'schemaVersion',
+            'seq',
+            'checksum',
+            'sourceKind',
+            'characterName',
+            'day',
+            'simulationState',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(campaignId)
+        && existing().ownerId == request.auth.uid;
+    }
+
+    // Métadonnées de session utilisateur (sans PII)
+    match /users/{userId}/meta/{metaId} {
+      allow get: if isVerifiedOwner(userId) && isValidId(userId) && isValidId(metaId);
+      allow list: if isVerifiedOwner(userId) && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(metaId)
+        && isValidUserMeta(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(metaId)
+        && isValidUserMeta(incoming(), userId)
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName',
+          'lastBackupSeq',
+          'updatedAt'
+        ]);
+
+      allow delete: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(metaId)
+        && existing().ownerId == request.auth.uid;
+    }
+  }
+}

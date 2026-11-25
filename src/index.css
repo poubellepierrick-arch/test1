@@ -3,23 +3,79 @@
 @layer base {
   body {
     font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
-    background-color: #f8f6f0;
-    color: #1c1917;
+    background-color: #ede4d0;
+    color: #231a14;
   }
 }
 
-/* Scrollbars sobres et discrets */
+.font-display {
+  font-family: 'Cinzel', 'Lora', Georgia, serif;
+}
+
+.font-journal {
+  font-family: 'Lora', Georgia, Cambria, serif;
+}
+
+/* Surfaces Donjons & Dragons : table, bois sombre, laiton et parchemin */
+.dnd-table-bg {
+  background-color: #ede4d0;
+  background-image:
+    radial-gradient(at 20% 10%, rgba(255, 250, 238, 0.55) 0px, transparent 55%),
+    radial-gradient(at 85% 90%, rgba(196, 170, 122, 0.22) 0px, transparent 50%);
+}
+
+.dnd-wood-bar {
+  background: linear-gradient(180deg, #312319 0%, #241911 100%);
+  border-color: #b48a3e;
+  color: #f6eedb;
+}
+
+.dnd-wood-header {
+  background: linear-gradient(180deg, #36271c 0%, #281c13 100%);
+  border-bottom: 1px solid #b48a3e;
+  color: #f6eedb;
+}
+
+.dnd-panel {
+  background-color: #fcf7eb;
+  border: 1px solid #cab58b;
+  box-shadow: 0 2px 6px rgba(45, 31, 18, 0.06);
+}
+
+.dnd-parchment-sheet {
+  background-color: #fbf5e6;
+  background-image:
+    radial-gradient(ellipse at top center, rgba(255, 253, 246, 0.85) 0%, transparent 70%),
+    radial-gradient(ellipse at bottom center, rgba(224, 206, 170, 0.28) 0%, transparent 75%);
+  border: 1px solid #bea574;
+  box-shadow:
+    0 4px 16px rgba(42, 28, 15, 0.1),
+    inset 0 0 28px rgba(182, 148, 89, 0.12);
+}
+
+.dnd-dropcap::first-letter {
+  font-family: 'Cinzel', Georgia, serif;
+  font-size: 2.3rem;
+  font-weight: 700;
+  line-height: 0.85;
+  float: left;
+  margin-right: 0.45rem;
+  margin-top: 0.14rem;
+  color: #854d0e;
+}
+
+/* Scrollbars bronze & parchemin */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: transparent;
+  background: rgba(202, 181, 139, 0.15);
 }
 ::-webkit-scrollbar-thumb {
-  background: #d6d3d1;
+  background: #bfa67a;
   border-radius: 9999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #a8a29e;
+  background: #9a7f4f;
 }

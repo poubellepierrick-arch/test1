@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { SimulationState } from '../types';
 import { ActionRequest } from '../engine/adjudication';
-import { MessageSquare, User, Send, HeartHandshake, History, Sparkles } from 'lucide-react';
+import { evaluerContexteLieu } from '../engine/context';
+import { MessageSquare, User, Send, HeartHandshake, History, Sparkles, Radio } from 'lucide-react';
 
 interface NpcDialogPanelProps {
   etat: SimulationState;
@@ -14,72 +15,51 @@ export const NpcDialogPanel: React.FC<NpcDialogPanelProps> = ({
   chargement,
   onExecuterAction,
 }) => {
-  const [pnjSelectionne, setPnjSelectionne] = useState<string>('npc_forgeron_torvin');
+  const ctx = evaluerContexteLieu(etat);
+  const pnjs = ctx.pnjsEnVue;
+
+  const [pnjSelectionne, setPnjSelectionne] = useState<string>(pnjs[0]?.id || '');
   const [sujetLibre, setSujetLibre] = useState('');
 
-  const pnjs = [
-    {
-      id: 'npc_forgeron_torvin',
-      nom: 'Torvin le Forgeron',
-      role: 'Artisan forge de Val-Gris',
-      alignement: 'Neutre Bon',
-      seuil: 'DD 13',
-      suggestions: [
-        'Demander du labeur d\'appoint à la forge',
-        'S\'enquérir de l\'état des filons de Roche-Noire',
-        'Faire expertiser l\'armure et les fers',
-      ],
-    },
-    {
-      id: 'npc_bailli_valgris',
-      nom: 'Bailli Rogar',
-      role: 'Magistrat civil de la Ligue',
-      alignement: 'Loyal Neutre',
-      seuil: 'DD 13',
-      suggestions: [
-        'Consulter les ordonnances et primes de la Ligue',
-        'Signaler les mouvements de patrouilles suspectes',
-        'Demander un sauf-conduit pour les cols marchands',
-      ],
-    },
-    {
-      id: 'npc_sentinelle_porte',
-      nom: 'Sentinelle Elia',
-      role: 'Garde des palissades',
-      alignement: 'Neutre',
-      seuil: 'DD 12',
-      suggestions: [
-        'Demander des nouvelles des sentiers du nord',
-        'Partager les observations sur la forêt des Tertres',
-        'Savoir si des caravanes sont attendues sous peu',
-      ],
-    },
-    {
-      id: 'npc_capitaine_morn',
-      nom: 'Capitaine Morn',
-      role: 'Commandant mercenaire',
-      alignement: 'Loyal Mauvais',
-      seuil: 'DD 15',
-      suggestions: [
-        'Négocier les tarifs de passage de la passe',
-        'Sonder les intentions du Bouclier de fer',
-        'Proposer vos bras pour un contrat d\'armes',
-      ],
-    },
-  ];
+  useEffect(() => {
+    if (pnjs.length > 0 && !pnjs.some(p => p.id === pnjSelectionne)) {
+      setPnjSelectionne(pnjs[0].id);
+    } else if (pnjs.length === 0 && pnjSelectionne !== '') {
+      setPnjSelectionne('');
+    }
+  }, [pnjs, pnjSelectionne]);
+
+  if (pnjs.length === 0) {
+    return (
+      <div className="bg-stone-50 border border-stone-200 rounded-lg p-3 text-xs text-stone-500">
+        Aucun PNJ dans votre champ de vision.
+      </div>
+    );
+  }
 
   const pnjActif = pnjs.find(p => p.id === pnjSelectionne) || pnjs[0];
-  const pnjNoeud = etat.grapheNoeuds.find(n => n.id === pnjActif.id);
-  const disposition = pnjNoeud?.proprietes?.disposition || 'NEUTRE';
-  const humeur = pnjNoeud?.proprietes?.humeur || 'Attentif et réservé';
-  const historique = (pnjNoeud?.proprietes?.historiqueDialogue as any[]) || [];
+  const pnjRecord = etat.pnjsMonde?.find(p => p.id === pnjActif.id);
+  const disposition = pnjActif.proprietes?.disposition || 'NEUTRE';
+  const humeur = pnjActif.proprietes?.humeur || 'Attentif';
+  const seuilDD = pnjActif.proprietes?.seuilDD || 12;
+  const role = pnjActif.proprietes?.profession || 'Voyageur';
+  const apparence = (pnjActif.proprietes?.apparence as string | undefined) || pnjRecord?.apparence;
+  const voixEtManies = (pnjActif.proprietes?.voixEtManies as string | undefined) || pnjRecord?.voixEtManies;
+  const lienHerosNature =
+    (pnjActif.proprietes?.lienHerosNature as string | undefined) || pnjRecord?.lienHerosNature;
+  const motifRencontre = pnjActif.proprietes?.motifRencontre as string | undefined;
+  const suggestions = (pnjActif.proprietes?.suggestions as string[]) || [
+    'Demander des nouvelles des environs',
+    'S\'enquérir des rumeurs locales',
+  ];
+  const historique = (pnjActif.proprietes?.historiqueDialogue as any[]) || [];
 
   const handleParler = (sujetParam?: string) => {
-    const texte = (sujetParam || sujetLibre).trim() || 'Situation générale et rumeurs régionales';
-    if (chargement) return;
+    const texte = (sujetParam || sujetLibre).trim() || 'Situation et rumeurs';
+    if (chargement || !pnjActif) return;
     onExecuterAction({
       type: 'DIALOGUER_PNJ',
-      pnjId: pnjSelectionne,
+      pnjId: pnjActif.id,
       sujetDialogue: texte,
     });
     setSujetLibre('');
@@ -89,19 +69,19 @@ export const NpcDialogPanel: React.FC<NpcDialogPanelProps> = ({
     switch (disp) {
       case 'AMICAL':
         return (
-          <span className="inline-flex items-center gap-1 text-[10px] text-emerald-800 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded font-medium">
+          <span className="inline-flex items-center gap-1 text-[10px] text-emerald-800 font-medium">
             <HeartHandshake className="w-3 h-3 text-emerald-600" /> Amical
           </span>
         );
       case 'MEFIANT':
         return (
-          <span className="inline-flex items-center gap-1 text-[10px] text-rose-800 bg-rose-50 border border-rose-200 px-1.5 py-0.2 rounded font-medium">
-            Méfiance
+          <span className="inline-flex items-center gap-1 text-[10px] text-rose-800 font-medium">
+            Méfiant
           </span>
         );
       default:
         return (
-          <span className="inline-flex items-center gap-1 text-[10px] text-stone-600 bg-stone-100 border border-stone-200 px-1.5 py-0.2 rounded font-medium">
+          <span className="inline-flex items-center gap-1 text-[10px] text-stone-600 font-medium">
             Neutre
           </span>
         );
@@ -111,16 +91,16 @@ export const NpcDialogPanel: React.FC<NpcDialogPanelProps> = ({
   return (
     <div className="space-y-3 text-xs">
       <div className="flex items-center justify-between text-stone-500 text-[11px]">
-        <span className="font-semibold uppercase tracking-wide">Rencontres & interlocuteurs locaux</span>
-        <span>{pnjs.length} PNJ accessibles</span>
+        <span className="font-semibold uppercase tracking-wide">Interlocuteurs en vue</span>
+        <span>{pnjs.length} présent(s)</span>
       </div>
 
       {/* Sélecteur de PNJ */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
         {pnjs.map(pnj => {
-          const estActif = pnj.id === pnjSelectionne;
-          const noeud = etat.grapheNoeuds.find(n => n.id === pnj.id);
-          const disp = noeud?.proprietes?.disposition || 'NEUTRE';
+          const estActif = pnj.id === pnjActif.id;
+          const disp = pnj.proprietes?.disposition || 'NEUTRE';
+          const pnjRole = pnj.proprietes?.profession || 'Voyageur';
           return (
             <button
               key={pnj.id}
@@ -134,38 +114,68 @@ export const NpcDialogPanel: React.FC<NpcDialogPanelProps> = ({
               <User className={`w-4 h-4 mt-0.5 shrink-0 ${estActif ? 'text-sky-700' : 'text-stone-400'}`} />
               <div className="space-y-0.5 flex-1 min-w-0">
                 <div className="font-bold flex items-center justify-between gap-1">
-                  <span className="truncate">{pnj.nom}</span>
+                  <span className="truncate">{pnj.label}</span>
                   {getDispositionBadge(disp)}
                 </div>
-                <div className="text-[11px] text-stone-500 truncate">{pnj.role}</div>
+                <div className="text-[11px] text-stone-500 truncate">
+                  {pnjRole}
+                  {pnj.proprietes?.estItinerant ? ' · En route' : ''}
+                </div>
               </div>
             </button>
           );
         })}
       </div>
 
-      {/* Cadre de dialogue approfondi */}
+      {/* Cadre de dialogue */}
       <div className="bg-stone-50 border border-stone-200 p-3 rounded-lg space-y-2.5">
         <div className="flex items-center justify-between border-b border-stone-200 pb-1.5 flex-wrap gap-1">
           <div className="flex items-center gap-1.5 font-bold text-stone-900">
             <MessageSquare className="w-3.5 h-3.5 text-sky-700" />
-            <span>Entretien avec {pnjActif.nom}</span>
+            <span>{pnjActif.label}</span>
+            <span className="text-[11px] font-normal text-stone-500">· {role}</span>
           </div>
           <div className="flex items-center gap-2 text-[10px] text-stone-500">
-            <span>Humeur : <strong className="text-stone-700 font-medium">{humeur}</strong></span>
+            <span>{humeur}</span>
             <span>·</span>
-            <span className="font-mono">{pnjActif.seuil} Persuasion</span>
+            <span className="font-mono">DD {seuilDD}</span>
           </div>
         </div>
 
-        {/* Pistes de conversation rapides */}
+        {(apparence || voixEtManies || lienHerosNature) && (
+          <div className="text-[11px] text-stone-700 bg-white border border-stone-200 rounded px-2.5 py-1.5 space-y-0.5">
+            {lienHerosNature && (
+              <div className="text-amber-900 font-medium">{lienHerosNature}</div>
+            )}
+            {apparence && <div>{apparence}</div>}
+            {voixEtManies && <div className="text-stone-500 italic">{voixEtManies}</div>}
+          </div>
+        )}
+
+        {motifRencontre && (
+          <div className="text-[11px] text-sky-900 bg-sky-50/70 border border-sky-200/70 rounded px-2 py-1">
+            {motifRencontre}
+          </div>
+        )}
+
+        {/* Sujets rapides + demande directe de rumeurs */}
         <div className="space-y-1">
-          <div className="flex items-center gap-1 text-[11px] text-stone-600 font-medium">
-            <Sparkles className="w-3 h-3 text-amber-600" />
-            <span>Sujets d'échange recommandés :</span>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1 text-[11px] text-stone-600 font-medium">
+              <Sparkles className="w-3 h-3 text-amber-600" />
+              <span>Sujets</span>
+            </div>
+            <button
+              onClick={() => onExecuterAction({ type: 'DEMANDER_RUMEURS', pnjId: pnjActif.id })}
+              disabled={chargement}
+              className="px-2 py-0.5 bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-900 rounded text-[11px] font-medium flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50"
+            >
+              <Radio className="w-3 h-3" />
+              Demander rumeurs
+            </button>
           </div>
           <div className="grid grid-cols-1 gap-1">
-            {pnjActif.suggestions.map((sug, i) => (
+            {suggestions.map((sug, i) => (
               <button
                 key={i}
                 onClick={() => handleParler(sug)}
@@ -179,7 +189,7 @@ export const NpcDialogPanel: React.FC<NpcDialogPanelProps> = ({
           </div>
         </div>
 
-        {/* Formulaire de question libre */}
+        {/* Question libre */}
         <form
           onSubmit={e => {
             e.preventDefault();
@@ -192,7 +202,7 @@ export const NpcDialogPanel: React.FC<NpcDialogPanelProps> = ({
             value={sujetLibre}
             onChange={e => setSujetLibre(e.target.value)}
             disabled={chargement}
-            placeholder={`Poser une question spécifique à ${pnjActif.nom}...`}
+            placeholder={`Question à ${pnjActif.label}...`}
             className="flex-1 bg-white border border-stone-300 rounded-md px-3 py-1.5 text-stone-900 placeholder-stone-400 focus:outline-none focus:border-stone-500 text-xs"
           />
           <button
@@ -201,22 +211,29 @@ export const NpcDialogPanel: React.FC<NpcDialogPanelProps> = ({
             className="px-3.5 py-1.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white rounded-md font-medium flex items-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
           >
             <Send className="w-3.5 h-3.5" />
-            <span>Questionner</span>
+            <span>Parler</span>
           </button>
         </form>
 
-        {/* Historique des échanges récents avec ce PNJ */}
+        {/* Historique des échanges */}
         {historique.length > 0 && (
           <div className="pt-2 border-t border-stone-200 space-y-1">
             <div className="flex items-center gap-1 text-[10px] text-stone-500 font-medium uppercase tracking-wider">
               <History className="w-3 h-3 text-stone-400" />
-              <span>Mémoire des échanges précédents :</span>
+              <span>Échanges récents</span>
             </div>
-            <div className="space-y-1 max-h-24 overflow-y-auto pr-1">
+            <div className="space-y-1 max-h-28 overflow-y-auto pr-1">
               {historique.map((h, idx) => (
-                <div key={idx} className="bg-white p-1.5 rounded border border-stone-200/70 text-[11px] flex justify-between gap-2">
-                  <span className="text-stone-800 italic truncate">« {h.sujet} »</span>
-                  <span className="text-stone-400 shrink-0 font-mono text-[10px]">{h.issue}</span>
+                <div key={idx} className="bg-white p-1.5 rounded border border-stone-200/70 text-[11px] space-y-0.5">
+                  <div className="flex justify-between gap-2">
+                    <span className="text-stone-800 italic truncate">« {h.sujet} »</span>
+                    <span className="text-stone-400 shrink-0 font-mono text-[10px]">{h.issue}</span>
+                  </div>
+                  {h.repliquePnj && (
+                    <div className="text-stone-700 leading-snug">
+                      → « {h.repliquePnj} »
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

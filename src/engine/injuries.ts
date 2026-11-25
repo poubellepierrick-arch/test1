@@ -153,7 +153,8 @@ export function fabriquerObjetBivouac(
 export function soignerBlessure(
   personnage: CharacterStats,
   blessureId: string,
-  avecRemede: boolean = true
+  avecRemede: boolean = true,
+  soigneurBourgadeDisponible: boolean = false
 ): {
   personnageModifie: CharacterStats;
   adjudication: AdjudicationPayload;
@@ -164,12 +165,41 @@ export function soignerBlessure(
 
   let desc = '';
   if (avecRemede) {
-    // Retrait de la blessure immédiatement grâce au traitement adéquat
+    const motsCles = ['bandage', 'cataplasme', 'trousse', 'compresse', 'attelle'];
+    const remedeItem = clone.inventaire.find(
+      item => item.quantite > 0 && motsCles.some(mot => item.nom.toLowerCase().includes(mot))
+    );
+
+    if (remedeItem) {
+      remedeItem.quantite -= 1;
+      if (remedeItem.quantite <= 0) {
+        clone.inventaire = clone.inventaire.filter(i => i.id !== remedeItem.id);
+      }
+      desc = `Soin appliqué (${remedeItem.nom} consommé) : ${blessure.nom} soignée.`;
+    } else if (soigneurBourgadeDisponible) {
+      const coutPA = 5;
+      const totalPA = clone.monnaies.po * 10 + clone.monnaies.pa;
+      if (totalPA < coutPA) {
+        throw new Error('Aucun remède en sacoche et fonds insuffisants pour l\'apothicaire (5 PA).');
+      }
+      if (clone.monnaies.pa >= coutPA) {
+        clone.monnaies.pa -= coutPA;
+      } else {
+        const reste = coutPA - clone.monnaies.pa;
+        clone.monnaies.pa = 0;
+        const poNecessaires = Math.ceil(reste / 10);
+        clone.monnaies.po -= poNecessaires;
+        clone.monnaies.pa += poNecessaires * 10 - reste;
+      }
+      desc = `Soin prodigué par l'apothicaire du bourg (5 PA) : ${blessure.nom} soignée.`;
+    } else {
+      throw new Error('Aucun bandage, cataplasme ou soigneur sur place.');
+    }
+
     clone.blessuresPersistantes = clone.blessuresPersistantes.filter(b => b.id !== blessureId);
     if (blessure.type === 'ENTORSE') {
       clone.vitessePieds = Math.min(30, clone.vitessePieds + 10);
     }
-    desc = `Pansement appliqué : ${blessure.nom} soignée et stabilisée avec succès.`;
   } else {
     blessure.joursReposRestants = Math.max(0, blessure.joursReposRestants - 1);
     desc = `Convalescence naturelle : 1 jour de guérison purgé pour ${blessure.nom} (${blessure.joursReposRestants}j restants).`;

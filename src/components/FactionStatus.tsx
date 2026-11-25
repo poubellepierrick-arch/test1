@@ -1,93 +1,175 @@
 import React, { useState } from 'react';
-import { Faction, WorldMarket, GraphNode } from '../types';
+import {
+  Faction,
+  WorldMarket,
+  GraphNode,
+  HexNode,
+  WorldEntity,
+  WorldChronicleEntry,
+} from '../types';
 import { Globe } from 'lucide-react';
 
 interface FactionStatusProps {
   factions: Faction[];
   marche: WorldMarket;
   grapheNoeuds: GraphNode[];
-  onTickManuel: () => void;
-  chargement: boolean;
+  hexagones?: HexNode[];
+  entitesMonde?: WorldEntity[];
+  chroniqueMonde?: WorldChronicleEntry[];
+  chargement?: boolean;
 }
+
+const POSTURE_LABEL: Record<string, string> = {
+  EXPANSION: 'Expansion',
+  DEFENSE: 'Défense',
+  COMMERCE: 'Commerce',
+  RAID: 'Raid',
+  TREVE: 'Trêve',
+};
+
+const TYPE_ENTITE_LABEL: Record<string, string> = {
+  CARAVANE: 'Convoi',
+  PATROUILLE: 'Patrouille',
+  RAIDER: 'Raiders',
+  MESSAGER: 'Messager',
+  REFUGIES: 'Réfugiés',
+};
 
 export const FactionStatus: React.FC<FactionStatusProps> = ({
   factions,
   marche,
-  grapheNoeuds,
-  onTickManuel,
-  chargement,
+  hexagones = [],
+  entitesMonde = [],
+  chroniqueMonde = [],
 }) => {
   const [ouvert, setOuvert] = useState(false);
 
+  const hexNomParId = (id: string) => hexagones.find(h => h.id === id)?.nom || id;
+  const multVivres = marche.multiplicateurVivres ?? 1.0;
+  const tendanceFleche =
+    marche.tendanceFer === 'HAUSSE' ? ' ↑' : marche.tendanceFer === 'BAISSE' ? ' ↓' : '';
+  const entitesActives = entitesMonde.filter(e => e.statut === 'EN_ROUTE');
+
   return (
-    <div className="bg-white border border-stone-200 shadow-xs rounded-lg p-3.5 text-xs space-y-2.5 text-stone-700">
+    <div className="dnd-panel rounded-lg p-3.5 text-xs space-y-2.5 text-[#3b2c1e]">
       <div className="flex justify-between items-center cursor-pointer select-none" onClick={() => setOuvert(!ouvert)}>
-        <div className="flex items-center gap-1.5 text-stone-900 font-bold">
-          <Globe className="w-4 h-4 text-emerald-700" />
-          <span>Géopolitique et économie du monde</span>
+        <div className="flex items-center gap-1.5 font-display text-[#2a1d13] font-semibold">
+          <Globe className="w-4 h-4 text-[#9c6f21]" />
+          <span>Factions & Marché</span>
         </div>
-        <button className="text-[11px] text-stone-400 hover:text-stone-700 font-medium">
+        <button type="button" className="text-[11px] text-[#78624a] hover:text-[#231a14] font-medium cursor-pointer">
           {ouvert ? 'Replier ▲' : 'Déplier ▼'}
         </button>
       </div>
 
       {/* Résumé permanent */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs pt-1 border-t border-stone-100">
-        <div className="bg-stone-50 p-2 rounded-md border border-stone-200">
-          <div className="text-stone-500 text-[10px]">Indice du fer</div>
-          <div className="font-bold text-stone-900 font-mono">x{marche.multiplicateurFer}</div>
-        </div>
-        <div className="bg-stone-50 p-2 rounded-md border border-stone-200">
-          <div className="text-stone-500 text-[10px]">Armurerie</div>
-          <div className={marche.penurieArmurerie ? 'font-bold text-rose-700' : 'text-stone-700 font-medium'}>
-            {marche.penurieArmurerie ? 'Pénurie active' : 'Normal'}
+      <div className="grid grid-cols-2 gap-2 text-xs pt-1.5 border-t border-[#d6c298]">
+        <div className="bg-[#f5edd8]/80 p-2 rounded-md border border-[#cfb88c]">
+          <div className="text-[#6d5742] text-[10px]">Fer{tendanceFleche}</div>
+          <div className={marche.penurieArmurerie ? 'font-bold text-rose-800 font-mono tabular-nums' : 'font-bold text-[#231a14] font-mono tabular-nums'}>
+            x{marche.multiplicateurFer} · {marche.penurieArmurerie ? 'Pénurie' : 'Stable'}
           </div>
         </div>
-        <div className="bg-stone-50 p-2 rounded-md border border-stone-200">
-          <div className="text-stone-500 text-[10px]">Sécurité des routes</div>
-          <div className="text-amber-800 font-bold">{marche.securiteRoutes}</div>
+        <div className="bg-[#f5edd8]/80 p-2 rounded-md border border-[#cfb88c]">
+          <div className="text-[#6d5742] text-[10px]">Vivres</div>
+          <div className={marche.penurieVivres ? 'font-bold text-amber-800 font-mono tabular-nums' : 'text-[#2a1f16] font-medium font-mono tabular-nums'}>
+            x{multVivres} · {marche.penurieVivres ? 'Tendus' : 'Normal'}
+          </div>
         </div>
-        <div className="bg-stone-50 p-2 rounded-md border border-stone-200 flex items-center justify-between">
-          <span className="text-stone-500 text-[10px]">Tick Faction</span>
-          <button
-            onClick={e => {
-              e.stopPropagation();
-              onTickManuel();
-            }}
-            disabled={chargement}
-            className="px-2 py-1 bg-white hover:bg-stone-100 text-stone-800 rounded border border-stone-300 text-[10px] font-medium shadow-2xs transition-colors"
-          >
-            Avancer Tick
-          </button>
+        <div className="bg-[#f5edd8]/80 p-2 rounded-md border border-[#cfb88c]">
+          <div className="text-[#6d5742] text-[10px]">Routes</div>
+          <div className="text-[#8c5a18] font-bold">{marche.securiteRoutes}</div>
+        </div>
+        <div className="bg-[#f5edd8]/80 p-2 rounded-md border border-[#cfb88c] flex flex-col justify-center">
+          <div className="text-[#6d5742] text-[10px]">Circulation</div>
+          <div className="text-[#231a14] font-semibold font-mono tabular-nums truncate">
+            {entitesActives.length} unité(s) · Tension {marche.indiceTensionCommerciale ?? 20}%
+          </div>
         </div>
       </div>
 
       {/* Détails complets si déplié */}
       {ouvert && (
-        <div className="space-y-3 pt-2 border-t border-stone-100">
-          <div className="text-stone-600 font-semibold text-[11px] uppercase tracking-wide">Factions actives :</div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <div className="space-y-2.5 pt-2 border-t border-[#d6c298]">
+          <div className="font-display text-[#6d5332] font-semibold text-[11px] tracking-wide uppercase">
+            Factions
+          </div>
+          <div className="space-y-2">
             {factions.map(faction => (
-              <div key={faction.id} className="bg-stone-50 border border-stone-200 p-2.5 rounded-md space-y-1">
-                <div className="font-bold text-stone-900">{faction.nom}</div>
-                <div className="text-[11px] text-stone-600 flex justify-between font-mono">
+              <div key={faction.id} className="bg-[#f5edd8]/75 border border-[#cfb88c] p-2.5 rounded-md space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-[#231a14]">{faction.nom}</span>
+                  {faction.posture && (
+                    <span className="text-[10px] font-mono text-[#6d5332]">
+                      {POSTURE_LABEL[faction.posture] || faction.posture}
+                    </span>
+                  )}
+                </div>
+                <div className="text-[11px] text-[#5c4734] flex justify-between font-mono tabular-nums">
                   <span>Force : {faction.forceMilitaire}</span>
-                  <span>Richesse : {faction.richesse}</span>
+                  <span>Moral : {faction.moral ?? 65}</span>
+                  <span>Or : {faction.richesse}</span>
                 </div>
-                <div className="text-[11px] text-stone-500">
-                  Contrôle : {faction.noeudsControles.length > 0 ? faction.noeudsControles.join(', ') : 'Aucun'}
+                <div className="text-[11px] text-[#6d5742]">
+                  Contrôle :{' '}
+                  {faction.noeudsControles.length > 0
+                    ? faction.noeudsControles.map(hexNomParId).join(', ')
+                    : 'Aucun'}
                 </div>
-                <div className="text-[11px] text-stone-600 border-t border-stone-200/80 pt-1">
-                  Objectif : {faction.objectifs[0]}
+                <div className="text-[11px] text-[#463626] border-t border-[#decba3] pt-1">
+                  {faction.effectifActif || faction.objectifs[0]}
                 </div>
               </div>
             ))}
           </div>
 
-          <div className="bg-stone-50 border border-stone-200 p-2.5 rounded-md text-[11px] text-stone-500">
-            <span className="text-stone-700 font-semibold">Simulation autonome : </span>
-            Ce module calcule les guerres, blocus et conquêtes minières indépendamment du joueur. Les prix en ville évoluent selon ces dynamiques.
-          </div>
+          {entitesActives.length > 0 && (
+            <div className="space-y-1.5 pt-1 border-t border-[#d6c298]">
+              <div className="font-display text-[#6d5332] font-semibold text-[11px] tracking-wide uppercase">
+                Mouvements
+              </div>
+              <div className="space-y-1">
+                {entitesActives.map(ent => (
+                  <div
+                    key={ent.id}
+                    className="bg-[#f5edd8]/75 border border-[#cfb88c] px-2.5 py-1.5 rounded text-[11px] space-y-0.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-medium text-[#231a14]">{ent.nom}</span>
+                      <span className="text-[10px] font-mono text-[#6d5332] shrink-0">
+                        {TYPE_ENTITE_LABEL[ent.type] || ent.type}
+                      </span>
+                    </div>
+                    <div className="text-[#6d5742] font-mono text-[10px]">
+                      {hexNomParId(ent.hexId)} → {hexNomParId(ent.destinationHexId)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {chroniqueMonde.length > 0 && (
+            <div className="space-y-1.5 pt-1 border-t border-[#d6c298]">
+              <div className="font-display text-[#6d5332] font-semibold text-[11px] tracking-wide uppercase">
+                Chronique
+              </div>
+              <div className="space-y-1 max-h-32 overflow-y-auto pr-0.5">
+                {chroniqueMonde.slice(0, 4).map(evt => (
+                  <div
+                    key={evt.id}
+                    className="bg-[#f5edd8]/75 border border-[#cfb88c] px-2.5 py-1.5 rounded text-[11px]"
+                  >
+                    <div className="flex justify-between text-[#231a14] font-medium">
+                      <span className="truncate">{evt.titre}</span>
+                      <span className="text-[10px] font-mono text-[#78624a] shrink-0">J{evt.jour}</span>
+                    </div>
+                    <div className="text-[10px] text-[#5c4734]">{evt.impact}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

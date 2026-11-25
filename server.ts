@@ -1,21 +1,99 @@
+import http from 'node:http';
 import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
-import { INITIAL_SIMULATION_STATE } from './src/engine/initialData';
-import { orchestrerActionDeterministe, ActionRequest } from './src/engine/adjudication';
-import { executerWorldTick } from './src/engine/factions';
+import { GoogleGenAI } from '@google/genai';
+import { ActionRequest } from './src/engine/adjudication';
+import {
+  simulerMondeComplet,
+  appliquerResultatMonde,
+  simulerAvancementTemporel,
+  CausalStepOutcome,
+} from './src/engine/worldSim';
 import { SimulationState, NarrativeEvent } from './src/types';
+import { executerTourMaitreDuJeu } from './src/server/gmOrchestrator';
+import { superviserJalonsMondeParIA, WorldSupervisionResult } from './src/server/worldSupervisor';
+import { assurerMemoireMJ } from './src/server/gmTools';
+import { compresserMemoireCampagne } from './src/server/gmCoherence';
+import { genererAudioScene, genererIllustrationScene } from './src/server/sceneMedia';
+import { chargerAjoutsCodex, sauvegarderAjoutsCodex } from './src/server/codexStore';
+import { obtenirManifesteCompletude, rechercherCompendium } from './src/engine/compendium';
+import { SrdCategory } from './src/types/srd';
+import { obtenirIllustrationObjet } from './src/server/itemIllustrations';
+import { globalSessionStore } from './src/server/sessionStore';
+import { extraireHerosEtDocuments } from './src/server/heroImporter';
+import {
+  genererMondeAzgaarStudio,
+  parserImportAzgaarJsonOuMap,
+  projeterSimulationDepuisAzgaarStudio,
+  synchroniserSecteurDepuisAzgaar,
+} from './src/engine/azgaarVoronoi';
+import { appliquerCommandeMJMonde, MjWorldCommand } from './src/engine/mjWorldEngine';
+import {
+  AzgaarClimateBias,
+  AzgaarStylePreset,
+  AzgaarTemplateId,
+  AzgaarWorldState,
+  WorldForgeDraft,
+  WorldForgeStep,
+} from './src/types';
+import {
+  appliquerBrouillonForgeASimulation,
+  creerBrouillonForgeInitial,
+} from './src/engine/worldForgeDraft';
+import {
+  enrichirPnjsPromusServeur,
+  executerEtapeForgeServeur,
+} from './src/server/worldForgeService';
+import {
+  AI_TIMEOUT_MS,
+  HTTP_SERVER_TIMEOUT_MS,
+  SSE_KEEPALIVE_INTERVAL_MS,
+} from './src/utils/aiTimeoutConfig';
+import { AiCancelledError } from './src/server/aiTimeout';
 
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '4mb' }));
 
 const PORT = 3000;
 
-// État mémoire persistant de la simulation côté serveur
-let currentWorldState: SimulationState = JSON.parse(JSON.stringify(INITIAL_SIMULATION_STATE));
+// Charger les ajouts personnalisés du Codex 5e dès le démarrage
+chargerAjoutsCodex();
+
+function obtenirSessionId(req: Request): string {
+  const headerId = req.headers['x-session-id'];
+  const queryId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
+  return globalSessionStore.normaliserId(
+    (Array.isArray(headerId) ? headerId[0] : headerId) || queryId
+  );
+}
+
+function lierSignalRequete(req: Request, res: Response) {
+  req.setTimeout?.(HTTP_SERVER_TIMEOUT_MS);
+  res.setTimeout?.(HTTP_SERVER_TIMEOUT_MS);
+  const controller = new AbortController();
+  const onAborted = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(new AiCancelledError());
+    }
+  };
+  const onClose = () => {
+    if (!res.writableEnded && !controller.signal.aborted) {
+      controller.abort(new AiCancelledError());
+    }
+  };
+  req.on('aborted', onAborted);
+  res.on('close', onClose);
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      req.off('aborted', onAborted);
+      res.off('close', onClose);
+    },
+  };
+}
 
 // Initialisation Gemini Server-Side si clé présente
 const apiKey = process.env.GEMINI_API_KEY;
@@ -24,6 +102,7 @@ if (apiKey) {
   aiClient = new GoogleGenAI({
     apiKey,
     httpOptions: {
+      timeout: AI_TIMEOUT_MS,
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -31,534 +110,715 @@ if (apiKey) {
   });
 }
 
-interface NarrationResultat {
-  texte: string;
-  tonAmbiance: 'CHAMPETRE' | 'SOMBRE' | 'PERIL' | 'NEUTRE';
-  suggestionsMJ: string[];
-  prompt: string;
-  systemPrompt: string;
-  modele: string;
-  reponseBrute: string;
-  latence: number;
-}
-
-function genererFallbackComplet(
-  action: ActionRequest,
-  adjudicationDesc: string,
-  etat: SimulationState
-): { texte: string; ton: 'CHAMPETRE' | 'SOMBRE' | 'PERIL' | 'NEUTRE'; suggestions: string[] } {
-  const estMort = etat.personnage.estMortDefinitivement;
-  const enCombat = etat.combat.actif;
-  const estEnBourgade = etat.hexActuel.pointInteret?.type === 'bourgade' || etat.hexActuel.securite === 'Sûr';
-  const aDonjon = etat.donjon && etat.donjon.actif;
-
-  if (estMort) {
-    return {
-      texte: `Le corps d'${etat.personnage.nom} repose à jamais sous l'herbe fanée. Le monde des vivants poursuit son cours indifférent, tandis que le vent d'ouest disperse les braises éteintes.`,
-      ton: 'PERIL',
-      suggestions: [
-        'Recommencer une nouvelle expédition',
-        'Inspecter le journal des événements',
-        'Consulter les archives de la simulation',
-      ],
-    };
-  }
-
-  if (enCombat) {
-    const ennemiVivant = etat.combat.ennemis.find(e => e.statut === 'ACTIF');
-    const nomEnnemi = ennemiVivant ? ennemiVivant.nom : 'l\'ennemi';
-    return {
-      texte: `L'acier heurte l'acier dans un éclat d'étincelles. Le souffle fétide de l'adversaire empeste la bête traquée et la poussière soulevée masque les battements du cœur. ${adjudicationDesc}`,
-      ton: 'PERIL',
-      suggestions: [
-        `Porter une frappe directe contre ${nomEnnemi}`,
-        'Adopter une posture d\'esquive défensive',
-        'Tenter de se désengager et fuir vers le couvert',
-      ],
-    };
-  }
-
-  if (aDonjon) {
-    return {
-      texte: `L'obscurité des voûtes souterraines suinte l'humidité et la vieille pierre taillée. L'écho d'une goutte d'eau résonne au loin dans le silence oppressant. ${adjudicationDesc}`,
-      ton: 'SOMBRE',
-      suggestions: [
-        'Progresser avec précaution vers la galerie suivante',
-        'Fouiller minutieusement les anfractuosités de la roche',
-        'Faire demi-tour vers la lumière de la surface',
-      ],
-    };
-  }
-
-  if (action.type === 'DIALOGUER_PNJ') {
-    const pnjId = action.pnjId || 'npc_forgeron_torvin';
-    const pnj = etat.grapheNoeuds.find(n => n.id === pnjId);
-    const nomPnj = pnj ? pnj.label : 'l\'interlocuteur';
-    return {
-      texte: `${nomPnj} essuie ses mains calleuses et vous considère d'un œil scrutateur. Le calme de la bourgade n'efface pas les soucis ordinaires du gagne-pain. ${adjudicationDesc}`,
-      ton: estEnBourgade ? 'CHAMPETRE' : 'SOMBRE',
-      suggestions: [
-        `Interroger ${nomPnj} sur les événements récents`,
-        `Demander si du travail ou une prime est disponible`,
-        'Prendre congé et poursuivre votre chemin dans le bourg',
-      ],
-    };
-  }
-
-  if (action.type === 'CORVEE_TRAVAIL') {
-    return {
-      texte: `Le travail manuel réchauffe les membres sous la brise rustique. L'odeur du bois fraîchement débité se mêle aux rumeurs échangées entre manœuvres. ${adjudicationDesc}`,
-      ton: 'CHAMPETRE',
-      suggestions: [
-        'Dépenser une partie de la paye au comptoir',
-        'Prendre un repos court pour soulager vos épaules',
-        'Consulter la sentinelle sur l\'état des sentiers',
-      ],
-    };
-  }
-
-  if (action.type === 'TROQUER') {
-    return {
-      texte: `La transaction s'opère au tintement sec des pièces de cuivre et d'argent sur l'étal de bois ciré. Le marchand range soigneusement le change. ${adjudicationDesc}`,
-      ton: 'CHAMPETRE',
-      suggestions: [
-        'Vérifier le poids et l\'encombrement de votre sac',
-        'Écouter les rumeurs colportées par les marchands',
-        'Inspecter le tableau des corvées du bourg',
-      ],
-    };
-  }
-
-  if (action.type === 'FORAGER') {
-    return {
-      texte: `Les doigts grattent l'humus humide à la recherche de tubercules et de baies sauvages. L'immensité de la nature impose sa cadence lente. ${adjudicationDesc}`,
-      ton: etat.hexActuel.terrain === 'Forêt Dense' || etat.hexActuel.terrain === 'Marais Fétide' ? 'SOMBRE' : 'NEUTRE',
-      suggestions: [
-        'Établir un bivouac de fortune pour consommer la récolte',
-        'Faire bouillir l\'eau recueillie avant de la boire',
-        'Reprendre la marche vers une clairière ou une route',
-      ],
-    };
-  }
-
-  if (action.type === 'REPOS_LONG' || action.type === 'REPOS_COURT') {
-    return {
-      texte: estEnBourgade
-        ? `La paille du dortoir communal et le murmure des conversations offrent un répit béni. Le corps retrouve sa vigueur dans la chaleur du bourg. ${adjudicationDesc}`
-        : `Le feu de camp crépite faiblement sous la voûte glaciale. Les ombres dansent sur les troncs noueux tandis que la nuit s'étire. ${adjudicationDesc}`,
-      ton: estEnBourgade ? 'CHAMPETRE' : 'SOMBRE',
-      suggestions: [
-        'Se lever et préparer ses paquetages pour le départ',
-        'Entretenir les lames et resserrer les courroies',
-        'Consulter la carte de voyage pour planifier l\'itinéraire',
-      ],
-    };
-  }
-
-  if (action.type === 'DEPLACER_HEX') {
-    const estDangereux = etat.hexActuel.securite === 'Dangereux' || etat.hexActuel.securite === 'Périlleux';
-    const ton: 'CHAMPETRE' | 'SOMBRE' | 'NEUTRE' = estEnBourgade ? 'CHAMPETRE' : estDangereux ? 'SOMBRE' : 'NEUTRE';
-    return {
-      texte: estEnBourgade
-        ? `L'entrée de Val-Gris s'ouvre sur un dédale de ruelles paisibles où flottent des effluves de soupe paysanne et de pain d'épeautre. ${adjudicationDesc}`
-        : `L'expédition aborde ${etat.hexActuel.nom}. Le paysage de ${etat.hexActuel.terrain.toLowerCase()} s'étend à perte de vue sous un ciel lourd. ${adjudicationDesc}`,
-      ton,
-      suggestions: estEnBourgade
-        ? [
-            'Aller à la forge de Torvin pour évaluer l\'équipement',
-            'Chercher du travail au tableau des corvées',
-            'S\'asseoir à l\'auberge pour écouter les nouvelles',
-          ]
-        : [
-            'Chercher des traces ou des ressources (Forager)',
-            'Établir un campement sécurisé avant la nuit',
-            'Poursuivre la marche vers l\'hexagone suivant',
-          ],
-    };
-  }
-
-  return {
-    texte: `${adjudicationDesc}`,
-    ton: estEnBourgade ? 'CHAMPETRE' : 'NEUTRE',
-    suggestions: [
-      'Observer attentivement les alentours immédiats',
-      'Vérifier les rations et l\'état de la troupe',
-      'Poursuivre votre progression sur le terrain',
-    ],
-  };
-}
-
-const SYSTEM_INSTRUCTION_IA = `Tu es le Maître du Jeu d'une aventure médiévale fantastique (D&D 5e) inspirée du contraste du Seigneur des Anneaux :
-- Le ton alterne entre :
-  1. LA DOUCEUR RUSTIQUE & CHAMPÊTRE : La vie quotidienne des gens normaux, le travail de la terre, l'odeur du pain chaud, la chaleur de l'âtre, les commérages des villageois, les haltes sous les chênes.
-  2. LA TENSION SOMBRE & OPPRESSANTE : Dans les bois profonds, les marais, les cols balayés par le blizzard et les ruines anciennes, le monde est froid, rude, hostile et menaçant.
-- RÈGLE D'OR : Le moteur déterministe backend détient la VÉRITÉ ABSOLUE (Ground Truth). Tu ne tires AUCUN dé, n'inventes aucun PV perdu/gagné ou objet non consigné dans l'adjudication.
-- DIALOGUES PNJ : Quand l'action est un dialogue, incarne véritablement le PNJ avec sa personnalité, sa voix terrienne ou austère et son niveau de confiance envers l'aventurier.
-- INTERACTION INTUITIVE : Tu dois TOUJOURS générer 3 suggestions d'action concrètes et pertinentes adaptées à la situation actuelle du joueur pour orienter son prochain choix.
-- Rédige un texte français sobre, immersif et condensé (2 à 4 phrases).
-- Réponds STRICTEMENT en format JSON valide conforme au schéma.`;
-
-async function genererNarration(
-  action: ActionRequest,
-  adjudication: any,
-  etat: SimulationState,
-  evenementFaction?: string
-): Promise<NarrationResultat> {
-  const debut = Date.now();
-  const fallback = genererFallbackComplet(action, adjudication.mutations_etat.descriptionTechnique, etat);
-
-  const pnjConcerne = action.pnjId ? etat.grapheNoeuds.find(n => n.id === action.pnjId) : null;
-  const memoirePnj = pnjConcerne?.proprietes ? JSON.stringify(pnjConcerne.proprietes) : 'Aucun';
-
-  const prompt = `Action du joueur: ${JSON.stringify(action)}
-Adjudication déterministe (Vérité absolue): ${JSON.stringify(adjudication)}
-État personnage: PV ${etat.personnage.pvActuels}/${etat.personnage.pvMax}, Épuisement Niv ${etat.personnage.epuisement}, Mort définitif: ${etat.personnage.estMortDefinitivement}
-Lieu actuel: ${etat.hexActuel.nom} (${etat.hexActuel.terrain}, Sécurité: ${etat.hexActuel.securite})
-Point d'intérêt: ${etat.hexActuel.pointInteret ? etat.hexActuel.pointInteret.nom : 'Nature sauvage'}
-Combat actif: ${etat.combat.actif ? `Oui (Round ${etat.combat.round})` : 'Non'}
-Donjon actif: ${etat.donjon?.actif ? `Oui (${etat.donjon.nom}, salle: ${etat.donjon.salleActuelleId})` : 'Non'}
-PNJ concerné: ${pnjConcerne ? `${pnjConcerne.label} (Mémoire: ${memoirePnj})` : 'Aucun'}
-Événement géopolitique hors-champ: ${evenementFaction || 'Aucun'}`;
-
-  if (!aiClient) {
-    const fin = Date.now();
-    return {
-      texte: fallback.texte,
-      tonAmbiance: fallback.ton,
-      suggestionsMJ: fallback.suggestions,
-      prompt,
-      systemPrompt: SYSTEM_INSTRUCTION_IA,
-      modele: 'Moteur Déterministe Backend (Fallback sans clé)',
-      reponseBrute: JSON.stringify(fallback),
-      latence: fin - debut,
-    };
-  }
-
-  try {
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION_IA,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            texte: {
-              type: Type.STRING,
-              description: 'Récit immersif en 2 à 4 phrases selon le ton approprié (Seigneur des Anneaux champêtre ou sombre).',
-            },
-            tonAmbiance: {
-              type: Type.STRING,
-              description: 'CHAMPETRE, SOMBRE, PERIL ou NEUTRE.',
-            },
-            suggestions: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: 'Exactement 3 suggestions d action concrètes et concises.',
-            },
-          },
-          required: ['texte', 'tonAmbiance', 'suggestions'],
-        },
-      },
-    });
-
-    const fin = Date.now();
-    const brut = response.text?.trim() || '';
-    let parsed: any = null;
-    try {
-      parsed = JSON.parse(brut);
-    } catch {
-      // Échec de parsing JSON, utilisation fallback
-    }
-
-    const texteFinal = parsed?.texte || fallback.texte;
-    const tonFinal: 'CHAMPETRE' | 'SOMBRE' | 'PERIL' | 'NEUTRE' =
-      parsed?.tonAmbiance === 'CHAMPETRE' ||
-      parsed?.tonAmbiance === 'SOMBRE' ||
-      parsed?.tonAmbiance === 'PERIL' ||
-      parsed?.tonAmbiance === 'NEUTRE'
-        ? parsed.tonAmbiance
-        : fallback.ton;
-    const suggestionsFinal = Array.isArray(parsed?.suggestions) && parsed.suggestions.length >= 3
-      ? parsed.suggestions.slice(0, 3)
-      : fallback.suggestions;
-
-    return {
-      texte: texteFinal,
-      tonAmbiance: tonFinal,
-      suggestionsMJ: suggestionsFinal,
-      prompt,
-      systemPrompt: SYSTEM_INSTRUCTION_IA,
-      modele: 'gemini-3.8-flash',
-      reponseBrute: brut || JSON.stringify(fallback),
-      latence: fin - debut,
-    };
-  } catch (err: any) {
-    console.warn('Erreur lors de l\'appel narration Gemini, recours au fallback enrichi:', err);
-    const fin = Date.now();
-    return {
-      texte: fallback.texte,
-      tonAmbiance: fallback.ton,
-      suggestionsMJ: fallback.suggestions,
-      prompt,
-      systemPrompt: SYSTEM_INSTRUCTION_IA,
-      modele: 'Fallback Déterministe Enrichi (Erreur API)',
-      reponseBrute: `Erreur: ${err.message || 'Échec appel API'}. Repli déterministe exécuté.`,
-      latence: fin - debut,
-    };
-  }
-}
-
-function determinerDonneesMobilisees(
-  action: ActionRequest,
-  adjudication: any,
-  etat: SimulationState,
-  evenementFaction?: string
-) {
-  const reglesSrd: string[] = [];
-  const attributsPersonnage: string[] = [];
-  const noeudsGraphInjectes: string[] = [];
-  const noeudsGraphFiltresMasques: string[] = [];
-  const hexagonesInterroges: string[] = [`${etat.hexActuel.nom} [${etat.hexActuel.q},${etat.hexActuel.r}] (${etat.hexActuel.terrain}, Sécurité: ${etat.hexActuel.securite})`];
-  const factionsImpliquees: string[] = [];
-  let formuleMathematique = '';
-
-  attributsPersonnage.push(`PV: ${etat.personnage.pvActuels}/${etat.personnage.pvMax}`);
-  attributsPersonnage.push(`Épuisement: Niv ${etat.personnage.epuisement}/6`);
-
-  if (action.type === 'DEPLACER_HEX') {
-    reglesSrd.push('SRD 5e Chapitre 8 : Cadence de marche et exploration par tranche de 6 miles');
-    reglesSrd.push(`DD de navigation topologique : ${adjudication.cible_dd_ou_ca}`);
-    attributsPersonnage.push(`Sagesse (Survie): mod ${adjudication.modificateur >= 0 ? '+' : ''}${adjudication.modificateur}`);
-    attributsPersonnage.push(`Eau consommée: ${adjudication.mutations_etat.eauDelta}L`);
-    formuleMathematique = `d20 (${adjudication.dice_roll}) + Modificateur (${adjudication.modificateur}) = ${adjudication.score_total} vs DD ${adjudication.cible_dd_ou_ca}`;
-    if (etat.personnage.heuresMarcheJour > 8) {
-      reglesSrd.push('SRD 5e Chapitre 8 : Marche Forcée (DD 10 + 1 par heure sup)');
-    }
-  } else if (action.type === 'FORAGER') {
-    reglesSrd.push('SRD 5e Chapitre 8 : Forage et Subsistance en milieu sauvage');
-    reglesSrd.push(`DD de Forage selon terrain : ${adjudication.cible_dd_ou_ca}`);
-    attributsPersonnage.push(`Rations actuelles: ${etat.personnage.rationsJours}j`);
-    formuleMathematique = `d20 (${adjudication.dice_roll}) + Modificateur (${adjudication.modificateur}) = ${adjudication.score_total} vs DD ${adjudication.cible_dd_ou_ca}`;
-  } else if (action.type === 'ATTAQUER') {
-    reglesSrd.push('SRD 5e Chapitre 9 : Jet d\'attaque avec arme de corps-à-corps');
-    reglesSrd.push(`Comparaison Seuil Classe d'Armure : CA ${adjudication.cible_dd_ou_ca}`);
-    attributsPersonnage.push('Force / Maîtrise d\'arme');
-    formuleMathematique = `d20 (${adjudication.dice_roll}) + Bonus attaque (${adjudication.modificateur}) = ${adjudication.score_total} vs CA ${adjudication.cible_dd_ou_ca}`;
-  } else if (action.type === 'TOUR_ENNEMI') {
-    reglesSrd.push('SRD 5e : IA Comportementale et jet d\'attaque hostile');
-    attributsPersonnage.push(`Classe d'Armure Joueur: CA ${etat.personnage.ca}`);
-    formuleMathematique = `d20 (${adjudication.dice_roll}) + Bonus attaque ennemie (${adjudication.modificateur}) = ${adjudication.score_total} vs CA Joueur ${adjudication.cible_dd_ou_ca}`;
-  } else if (action.type === 'CORVEE_TRAVAIL') {
-    reglesSrd.push('SRD 5e Chapitre 8 : Subsistance, corvées journalières et fatigue de labeur');
-    reglesSrd.push(`Test de caractéristique de labeur vs Seuil DD ${adjudication.cible_dd_ou_ca}`);
-    attributsPersonnage.push('Force / Sagesse / Endurance');
-    formuleMathematique = `d20 (${adjudication.dice_roll}) + Modificateur (${adjudication.modificateur}) = ${adjudication.score_total} vs DD ${adjudication.cible_dd_ou_ca}`;
-  } else if (action.type === 'TROQUER') {
-    reglesSrd.push('SRD 5e Chapitre 5 : Économie monétaire (1 PO = 10 PA = 100 PC)');
-    reglesSrd.push(`Indicateur macro-économique du fer : x${etat.marche.multiplicateurFer}`);
-    attributsPersonnage.push(`Solde: ${etat.personnage.monnaies.po} PO, ${etat.personnage.monnaies.pa} PA, ${etat.personnage.monnaies.pc} PC`);
-    formuleMathematique = 'Prix déterministe = Coût unitaire * Multiplicateur Pénurie';
-  } else if (action.type === 'DIALOGUER_PNJ') {
-    reglesSrd.push('SRD 5e Chapitre 7 : Interactions sociales et seuils d\'attitude PNJ');
-    attributsPersonnage.push('Charisme (Persuasion / Perspicacité)');
-    formuleMathematique = `d20 (${adjudication.dice_roll}) + Modificateur CHA (${adjudication.modificateur}) = ${adjudication.score_total} vs DD ${adjudication.cible_dd_ou_ca}`;
-  } else if (action.type === 'ESQUIVER') {
-    reglesSrd.push('SRD 5e Chapitre 9 : Action Esquiver (Désavantage conféré aux attaquants)');
-    attributsPersonnage.push(`CA actuelle: ${etat.personnage.ca}`);
-    formuleMathematique = 'Posturedéfensive active = 1 tour complet';
-  } else if (action.type === 'LANCER_SORT') {
-    reglesSrd.push('SRD 5e Chapitre 10 : Lancement de sorts & dépense d\'emplacements');
-    attributsPersonnage.push(`Emplacement dépensé: Niveau 1`);
-    formuleMathematique = `Jet magique (${adjudication.dice_roll}) vs Seuil ${adjudication.cible_dd_ou_ca || 'Effet direct'}`;
-  } else if (action.type === 'FUIR_TACTIQUE') {
-    reglesSrd.push('SRD 5e Chapitre 9 : Action Se désengager & Retraite sous pression');
-    attributsPersonnage.push('Dextérité (Acrobaties / Vitesse)');
-    formuleMathematique = `d20 (${adjudication.dice_roll}) + Mod DEX (${adjudication.modificateur}) = ${adjudication.score_total} vs DD ${adjudication.cible_dd_ou_ca}`;
-  } else if (action.type === 'REPOS_LONG') {
-    reglesSrd.push('SRD 5e Chapitre 8 : Repos Long (8 heures, restauration PV et emplacements de sorts)');
-    reglesSrd.push('World Tick asynchrone des factions déclenché');
-  } else if (action.type === 'JETS_MORT') {
-    reglesSrd.push('SRD 5e Chapitre 9 : Sauvegardes contre la mort (DD 10, 3 échecs = Permadeath)');
-    formuleMathematique = `d20 pur (${adjudication.dice_roll}) vs DD 10`;
-  } else {
-    reglesSrd.push('SRD 5e : Test de compétence libre sous contrôle arbitral backend');
-    formuleMathematique = `d20 (${adjudication.dice_roll}) + Modificateur (${adjudication.modificateur}) = ${adjudication.score_total} vs DD ${adjudication.cible_dd_ou_ca}`;
-  }
-
-  // Filtrage Boundary-Aware du graphe de connaissances
-  const pnjCibleId = action.type === 'DIALOGUER_PNJ' ? action.pnjId : undefined;
-  for (const n of etat.grapheNoeuds) {
-    if (pnjCibleId) {
-      if (n.id === pnjCibleId || n.type === 'Location' || n.connuParEntites?.includes(pnjCibleId)) {
-        noeudsGraphInjectes.push(`${n.label} (${n.type})`);
-      } else {
-        noeudsGraphFiltresMasques.push(`${n.label} (${n.type}) [Masqué - Non transmis au PNJ local]`);
-      }
-    } else {
-      if (n.type === 'Location' || n.id === 'npc_forgeron_torvin' || n.connuParEntites?.includes('hex_0000_bourgade')) {
-        noeudsGraphInjectes.push(`${n.label} (${n.type})`);
-      } else {
-        noeudsGraphFiltresMasques.push(`${n.label} (${n.type}) [Masqué - Non transmis au PNJ local]`);
-      }
-    }
-  }
-
-  for (const f of etat.factions) {
-    if (f.noeudsControles.includes(etat.hexActuel.id) || (evenementFaction && evenementFaction.includes(f.nom))) {
-      factionsImpliquees.push(`${f.nom} (Force: ${f.forceMilitaire}, Richesse: ${f.richesse})`);
-    }
-  }
-
-  return {
-    reglesSrd,
-    attributsPersonnage,
-    noeudsGraphInjectes,
-    noeudsGraphFiltresMasques,
-    hexagonesInterroges,
-    factionsImpliquees,
-    formuleMathematique,
-  };
-}
-
 // Endpoints REST
-app.get('/api/simulation/state', (_req: Request, res: Response) => {
-  res.json(currentWorldState);
+app.get('/api/codex/manifest', (_req: Request, res: Response) => {
+  res.json(obtenirManifesteCompletude());
+});
+
+app.get('/api/codex/search', (req: Request, res: Response) => {
+  const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+  const cat = typeof req.query.categorie === 'string' ? (req.query.categorie as SrdCategory | 'tout') : 'tout';
+  const biome = typeof req.query.biome === 'string' ? req.query.biome : undefined;
+  const fpMax = typeof req.query.fpMax === 'string' && req.query.fpMax !== '' ? Number(req.query.fpMax) : undefined;
+  const limite = typeof req.query.limite === 'string' ? Number(req.query.limite) : 50;
+
+  const resultats = rechercherCompendium({
+    requete: q,
+    categorie: cat,
+    biome,
+    fpMax,
+    limite,
+  });
+  res.json({ resultats, manifest: obtenirManifesteCompletude() });
+});
+
+app.post('/api/codex/import', (req: Request, res: Response) => {
+  try {
+    const entries = Array.isArray(req.body) ? req.body : req.body?.entries;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      res.status(400).json({ succes: false, erreur: 'Tableau JSON d\'entrées requis.' });
+      return;
+    }
+    const out = sauvegarderAjoutsCodex(entries);
+    res.json({ succes: true, ...out });
+  } catch (err: any) {
+    res.status(400).json({ succes: false, erreur: err?.message || 'Import invalide.' });
+  }
+});
+
+app.post('/api/items/illustration', async (req: Request, res: Response) => {
+  const reqSignal = lierSignalRequete(req, res);
+  try {
+    const body = req.body || {};
+    if (!body.nom && !body.itemId) {
+      res.status(400).json({ succes: false, erreur: 'Objet requis.' });
+      return;
+    }
+    const result = await obtenirIllustrationObjet(
+      aiClient,
+      {
+        itemId: String(body.itemId || body.nom),
+        nom: String(body.nom || body.itemId),
+        nomEn: typeof body.nomEn === 'string' ? body.nomEn : undefined,
+        sousCategorie: typeof body.sousCategorie === 'string' ? body.sousCategorie : undefined,
+        rarete: typeof body.rarete === 'string' ? body.rarete : undefined,
+        effet: typeof body.effet === 'string' ? body.effet : undefined,
+        degats: typeof body.degats === 'string' ? body.degats : undefined,
+        caBase: typeof body.caBase === 'number' ? body.caBase : undefined,
+      },
+      { signal: reqSignal.signal, timeoutMs: AI_TIMEOUT_MS }
+    );
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.json({ succes: true, ...result });
+    }
+  } catch (err: any) {
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.status(500).json({ succes: false, erreur: err?.message || 'Erreur illustration.' });
+    }
+  } finally {
+    reqSignal.cleanup();
+  }
+});
+
+app.post('/api/character/import', async (req: Request, res: Response) => {
+  const reqSignal = lierSignalRequete(req, res);
+  try {
+    const rawText = typeof req.body?.rawText === 'string' ? req.body.rawText : '';
+    const files = Array.isArray(req.body?.files) ? req.body.files : [];
+    const resultat = await extraireHerosEtDocuments(aiClient, rawText, files, {
+      signal: reqSignal.signal,
+      timeoutMs: AI_TIMEOUT_MS,
+    });
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.json({
+        succes: true,
+        hero: resultat.hero,
+        sourceMode: resultat.sourceMode,
+      });
+    }
+  } catch (err: any) {
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.status(400).json({ succes: false, erreur: err?.message || 'Analyse impossible.' });
+    }
+  } finally {
+    reqSignal.cleanup();
+  }
+});
+
+app.get('/api/simulation/state', (req: Request, res: Response) => {
+  const sessionId = obtenirSessionId(req);
+  res.json(globalSessionStore.getState(sessionId));
+});
+
+app.post('/api/simulation/hydrate', (req: Request, res: Response) => {
+  const sessionId = obtenirSessionId(req);
+  const etat = req.body?.etat as SimulationState | undefined;
+  if (!etat || !etat.personnage || !etat.horloge || !Array.isArray(etat.hexagones)) {
+    res.status(400).json({ succes: false, erreur: 'État de simulation invalide.' });
+    return;
+  }
+  const saved = globalSessionStore.setState(sessionId, etat);
+  res.json({ succes: true, etat: saved });
 });
 
 app.post('/api/simulation/act', async (req: Request, res: Response) => {
+  const reqSignal = lierSignalRequete(req, res);
   try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
     const action: ActionRequest = req.body;
-    const { nouvelEtat, adjudication, evenementFactionTexte } = orchestrerActionDeterministe(currentWorldState, action);
-    
-    // Génération narrative sobre conforme à l'adjudication avec capture de télémétrie
-    const narrationRes = await genererNarration(action, adjudication, nouvelEtat, evenementFactionTexte);
-    const donneesMobilisees = determinerDonneesMobilisees(action, adjudication, nouvelEtat, evenementFactionTexte);
-
-    const traceExecution = {
-      seq: nouvelEtat._seq,
-      timestamp: `Jour ${nouvelEtat.horloge.jour}, ${String(nouvelEtat.horloge.heure).padStart(2, '0')}:00`,
-      actionType: action.type,
-      donneesEntree: action as any,
-      promptSystemeIa: narrationRes.systemPrompt,
-      promptUtilisateurIa: narrationRes.prompt,
-      reponseBruteIa: narrationRes.reponseBrute,
-      modeleIa: narrationRes.modele,
-      latenceMs: narrationRes.latence,
-      donneesUtilisees: donneesMobilisees,
-    };
-
-    const evenementNarratif: NarrativeEvent = {
-      _seq: nouvelEtat._seq,
-      horodatageTick: nouvelEtat.horloge.tick,
-      horodatageDate: `Jour ${nouvelEtat.horloge.jour}, ${String(nouvelEtat.horloge.heure).padStart(2, '0')}:00`,
-      titre: action.type.replace('_', ' '),
-      texteNarratif: narrationRes.texte,
-      tonAmbiance: narrationRes.tonAmbiance,
-      suggestionsMJ: narrationRes.suggestionsMJ,
-      adjudication,
-      evenementFaction: evenementFactionTexte ? {
-        factionNom: 'Factions du Monde',
-        cibleNoeudNom: 'Géopolitique',
-        action: 'World Tick',
-        impact: evenementFactionTexte,
-      } : undefined,
-      trace: traceExecution,
-    };
-
-    nouvelEtat.journalNarratif.push(evenementNarratif);
-    if (!nouvelEtat.historiqueTraces) nouvelEtat.historiqueTraces = [];
-    nouvelEtat.historiqueTraces.push(traceExecution);
-
-    currentWorldState = nouvelEtat;
+    const resultat = await executerTourMaitreDuJeu(aiClient, etatCourant, action, undefined, {
+      signal: reqSignal.signal,
+      timeoutMs: AI_TIMEOUT_MS,
+    });
+    if (reqSignal.signal.aborted || res.writableEnded) return;
+    const saved = globalSessionStore.setState(sessionId, resultat.nouvelEtat);
 
     res.json({
       succes: true,
-      etat: currentWorldState,
-      dernierEvenement: evenementNarratif,
+      etat: saved,
+      dernierEvenement: resultat.evenementNarratif,
     });
   } catch (error: any) {
-    console.error('Erreur adjudication:', error);
-    res.status(400).json({ succes: false, erreur: error.message || 'Erreur inconnue' });
+    if (reqSignal.signal.aborted || res.writableEnded) return;
+    const msg = String(error?.message || 'Erreur inconnue');
+    const status = /quota/i.test(msg) ? 429 : 400;
+    if (!msg.startsWith('Le MJ IA')) {
+      console.error('Erreur adjudication:', msg);
+    }
+    res.status(status).json({ succes: false, erreur: msg });
+  } finally {
+    reqSignal.cleanup();
   }
 });
 
-app.post('/api/simulation/tick', async (_req: Request, res: Response) => {
+// Endpoint SSE en streaming temps réel pour les actions du joueur
+app.post('/api/simulation/act/stream', async (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  const reqSignal = lierSignalRequete(req, res);
+
+  const sendEvent = (event: string, data: any) => {
+    if (res.writableEnded || reqSignal.signal.aborted) return;
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const keepaliveTimer = setInterval(() => {
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.write(': keepalive\n\n');
+    }
+  }, SSE_KEEPALIVE_INTERVAL_MS);
+
   try {
-    const debut = Date.now();
-    const tickRes = executerWorldTick(
-      currentWorldState.horloge.tick,
-      currentWorldState.factions,
-      currentWorldState.hexagones,
-      currentWorldState.marche
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const action: ActionRequest = req.body;
+    const resultat = await executerTourMaitreDuJeu(
+      aiClient,
+      etatCourant,
+      action,
+      {
+        onAdjudication: (adjudication, etatIntermediaire) => {
+          sendEvent('adjudication_event', {
+            adjudication,
+            personnage: etatIntermediaire.personnage,
+            horloge: etatIntermediaire.horloge,
+            hexActuel: etatIntermediaire.hexActuel,
+            combat: etatIntermediaire.combat,
+            donjon: etatIntermediaire.donjon,
+            modeNarration: etatIntermediaire.modeNarration,
+            profilHydrogen: etatIntermediaire.profilHydrogen,
+            jetEnAttente: etatIntermediaire.jetEnAttente ?? null,
+          });
+        },
+        onChunk: (deltaText) => {
+          sendEvent('narration_chunk', { text: deltaText });
+        },
+        onRetryStatus: (info) => {
+          sendEvent('status_retry', info);
+        },
+      },
+      { signal: reqSignal.signal, timeoutMs: AI_TIMEOUT_MS }
     );
 
-    currentWorldState._seq += 1;
-    currentWorldState.horloge.tick = tickRes.nouveauTick;
-    currentWorldState.factions = tickRes.factionsModifiees;
-    currentWorldState.hexagones = tickRes.hexagonesModifies;
-    currentWorldState.marche = tickRes.marcheModifie;
+    if (reqSignal.signal.aborted || res.writableEnded) return;
+    const saved = globalSessionStore.setState(sessionId, resultat.nouvelEtat);
+    sendEvent('narration_done', {
+      succes: true,
+      etat: saved,
+      dernierEvenement: resultat.evenementNarratif,
+    });
+    if (!res.writableEnded) res.end();
+  } catch (error: any) {
+    if (!reqSignal.signal.aborted && !res.writableEnded) {
+      const msg = String(error?.message || 'Erreur inconnue');
+      if (!msg.startsWith('Le MJ IA')) {
+        console.error('Erreur stream MJ:', msg);
+      }
+      sendEvent('narration_error', {
+        succes: false,
+        erreur: msg,
+      });
+      res.end();
+    }
+  } finally {
+    clearInterval(keepaliveTimer);
+    reqSignal.cleanup();
+  }
+});
 
-    const texteFaction = tickRes.journalFactions.join(' | ') || 'Aucun mouvement majeur.';
+app.post('/api/simulation/tick', async (req: Request, res: Response) => {
+  const reqSignal = lierSignalRequete(req, res);
+  try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const etat: SimulationState = JSON.parse(JSON.stringify(etatCourant));
+    const debut = Date.now();
+    const tickDebut = etat.horloge.tick;
+
+    const heuresBody = req.body?.heures;
+    const modeHeures = typeof heuresBody === 'number' && Number.isFinite(heuresBody) && heuresBody > 0;
+    const heuresSautees = modeHeures ? Math.max(1, Math.min(720, Math.round(Number(heuresBody)))) : 0;
+    const nbTicksRaw = Number(req.body?.ticks ?? 1);
+    const nbTicks = Number.isFinite(nbTicksRaw) ? Math.max(1, Math.min(30, Math.floor(nbTicksRaw))) : 1;
+    const avecSupervisionIa = Boolean(req.body?.avecSupervisionIa);
+
+    let stepOutcome: CausalStepOutcome = {
+      journaux: [],
+      chroniqueAjoutee: [],
+      jalonsDetectes: [],
+      resumeCausal: '',
+    };
+
+    if (modeHeures) {
+      stepOutcome = simulerAvancementTemporel(etat, heuresSautees);
+    } else {
+      const journauxCumules: string[] = [];
+      const chroniquesCumulees = [] as CausalStepOutcome['chroniqueAjoutee'];
+      for (let i = 0; i < nbTicks; i += 1) {
+        const { etatModifie, resultat } = simulerMondeComplet(etat, { evoluerTempsMeteo: true });
+        appliquerResultatMonde(etat, etatModifie);
+        if (resultat.journalFactions.length > 0) {
+          journauxCumules.push(...resultat.journalFactions);
+        }
+        chroniquesCumulees.push(...resultat.chroniqueAjouts);
+      }
+      stepOutcome = {
+        journaux: journauxCumules,
+        chroniqueAjoutee: chroniquesCumulees,
+        jalonsDetectes: ['JOUR'],
+        resumeCausal: journauxCumules.slice(0, 3).join(' | ') || 'Cycle quotidien simulé.',
+      };
+    }
+
+    let supervision: WorldSupervisionResult | null = null;
+    const doitSuperviser =
+      avecSupervisionIa &&
+      (stepOutcome.jalonsDetectes.includes('JOUR') ||
+        stepOutcome.jalonsDetectes.includes('SEMAINE') ||
+        stepOutcome.jalonsDetectes.includes('MOIS') ||
+        stepOutcome.chroniqueAjoutee.length > 0);
+
+    if (doitSuperviser) {
+      supervision = await superviserJalonsMondeParIA(
+        aiClient,
+        etat,
+        {
+          heuresSautees: modeHeures ? heuresSautees : nbTicks * 24,
+          jalonsDetectes: stepOutcome.jalonsDetectes,
+          resumeCausal: stepOutcome.resumeCausal,
+          chroniqueRecente: etat.chroniqueMonde || stepOutcome.chroniqueAjoutee,
+        },
+        {
+          signal: reqSignal.signal,
+          timeoutMs: AI_TIMEOUT_MS,
+        }
+      );
+    }
+
+    if (reqSignal.signal.aborted || res.writableEnded) {
+      return;
+    }
+
+    etat._seq += 1;
+    const texteFaction =
+      supervision?.syntheseCausale ||
+      stepOutcome.resumeCausal ||
+      stepOutcome.journaux.join(' | ') ||
+      'Aucun mouvement majeur.';
+
+    const labelSaut = modeHeures
+      ? heuresSautees >= 720
+        ? '+1 mois'
+        : heuresSautees >= 168
+          ? '+1 semaine'
+          : heuresSautees >= 24
+            ? `+${Math.round(heuresSautees / 24)}j`
+            : `+${heuresSautees}h`
+      : `+${nbTicks} tick${nbTicks > 1 ? 's' : ''}`;
+
+    assurerMemoireMJ(etat);
+    etat.memoireMJ!.filNarratif.push(
+      `Jour ${etat.horloge.jour}, ${String(etat.horloge.heure).padStart(2, '0')}:00 — Monde (${labelSaut}) : ${texteFaction}`
+    );
+    compresserMemoireCampagne(etat, 8);
+
     const fin = Date.now();
+    const nbEntitesActives = (etat.entitesMonde || []).filter(e => e.statut === 'EN_ROUTE').length;
 
     const traceTick = {
-      seq: currentWorldState._seq,
-      timestamp: `Jour ${currentWorldState.horloge.jour}, ${String(currentWorldState.horloge.heure).padStart(2, '0')}:00`,
+      seq: etat._seq,
+      timestamp: `Jour ${etat.horloge.jour}, ${String(etat.horloge.heure).padStart(2, '0')}:00`,
       actionType: 'WORLD_TICK_FACTIONS',
-      donneesEntree: { tickPrecedent: currentWorldState.horloge.tick - 1, nouveauTick: tickRes.nouveauTick },
-      promptSystemeIa: 'Moteur autonome hors-champ sans sollicitation IA (Simulation algorithmique pure).',
-      promptUtilisateurIa: 'Calcul asynchrone des oppositions de factions.',
+      donneesEntree: {
+        tickPrecedent: tickDebut,
+        nouveauTick: etat.horloge.tick,
+        heuresSautees: modeHeures ? heuresSautees : undefined,
+        ticksExecutes: Math.max(0, etat.horloge.tick - tickDebut),
+        superviseParIa: Boolean(supervision),
+      },
+      promptSystemeIa: supervision
+        ? 'Supervision IA Gemini 4 Hydrogen sur jalons procéduraux.'
+        : 'Moteur causal continu multi-échelles (Simulation procédurale pure).',
+      promptUtilisateurIa: `Évolution temporelle (${labelSaut}) : météo, hydrologie, ressources, convois, diplomatie, marché et chronique.`,
       reponseBruteIa: texteFaction,
-      modeleIa: 'Algorithme Déterministe de Factions',
+      modeleIa: supervision ? supervision.modeleUtilise : 'Moteur Causal Procédural',
       latenceMs: fin - debut,
       donneesUtilisees: {
-        reglesSrd: ['Algorithme de Simulation Asynchrone : Score = d20 + Actifs + Modificateur Terrain'],
+        reglesSrd: [`Simulation multi-échelles (${labelSaut}) : ${stepOutcome.jalonsDetectes.join(', ') || 'HEURE'}`],
         attributsPersonnage: ['Aucun (Résolution hors du champ de vision du joueur)'],
-        noeudsGraphInjectes: ['Nœuds de factions et points d\'intérêt régionaux'],
-        noeudsGraphFiltresMasques: ['Tous les faits tenus secrets des populations locales'],
-        hexagonesInterroges: currentWorldState.hexagones.map(h => `${h.nom} (Contrôle: ${h.factionControleId || 'Aucun'}, Sécurité: ${h.securite})`),
-        factionsImpliquees: currentWorldState.factions.map(f => `${f.nom} (Force: ${f.forceMilitaire}, Richesse: ${f.richesse})`),
-        formuleMathematique: 'Score Attaque (d20 + Force/10) vs Score Défense (d20 + Terrain)',
+        noeudsGraphInjectes: [
+          `${stepOutcome.chroniqueAjoutee.length} entrée(s) chronique`,
+          `${nbEntitesActives} unité(s) en mouvement`,
+        ],
+        noeudsGraphFiltresMasques: ['Événements non encore propagés jusqu’à l’hexagone du joueur'],
+        hexagonesInterroges: etat.hexagones.map(
+          h => `${h.nom} (Contrôle: ${h.factionControleId || 'Aucun'}, Sécurité: ${h.securite}, Pression: ${h.pressionDanger ?? 0})`
+        ),
+        factionsImpliquees: etat.factions.map(
+          f => `${f.nom} (${f.posture || 'ACTIF'}, Force: ${f.forceMilitaire}, Moral: ${f.moral ?? 65}, Richesse: ${f.richesse})`
+        ),
+        formuleMathematique: 'Cause-à-effet continu (Heure/Jour/Semaine/Mois) + d20 contextuel',
       },
     };
 
     const evt: NarrativeEvent = {
-      _seq: currentWorldState._seq,
-      horodatageTick: currentWorldState.horloge.tick,
-      horodatageDate: `Jour ${currentWorldState.horloge.jour}, ${String(currentWorldState.horloge.heure).padStart(2, '0')}:00`,
-      titre: 'Mouvement de Faction (World Tick)',
-      texteNarratif: `Les forces politiques et militaires ont agi hors de vue. ${texteFaction}`,
+      _seq: etat._seq,
+      horodatageTick: etat.horloge.tick,
+      horodatageDate: `Jour ${etat.horloge.jour}, ${String(etat.horloge.heure).padStart(2, '0')}:00`,
+      titre: supervision ? supervision.titreChronique : `Évolution du monde (${labelSaut})`,
+      texteNarratif: supervision
+        ? `${supervision.syntheseCausale} ${supervision.consequencesPrevisibles}`
+        : `Le monde a poursuivi son cours (${labelSaut}). ${texteFaction}`,
       tonAmbiance: 'NEUTRE',
       suggestionsMJ: [
-        'Consulter l\'état des factions et des routes commerciales',
-        'Observer les mouvements de patrouilles aux abords du camp',
+        'Consulter l\'état des factions et des flux commerciaux',
+        'Observer les changements sur la carte du secteur',
         'Poursuivre votre expédition selon votre plan de route',
       ],
       evenementFaction: {
-        factionNom: 'Système Géopolitique',
+        factionNom: supervision ? 'Supervision MJ IA' : 'Simulation Monde',
         cibleNoeudNom: 'Monde',
-        action: 'Simulation Asynchrone',
+        action: `Saut temporel (${labelSaut})`,
         impact: texteFaction,
       },
       trace: traceTick,
     };
 
-    currentWorldState.journalNarratif.push(evt);
-    if (!currentWorldState.historiqueTraces) currentWorldState.historiqueTraces = [];
-    currentWorldState.historiqueTraces.push(traceTick);
+    etat.journalNarratif.push(evt);
+    if (!etat.historiqueTraces) etat.historiqueTraces = [];
+    etat.historiqueTraces.push(traceTick);
 
-    res.json({ succes: true, etat: currentWorldState, dernierEvenement: evt });
+    const saved = globalSessionStore.setState(sessionId, etat);
+    res.json({ succes: true, etat: saved, dernierEvenement: evt, supervision });
   } catch (error: any) {
-    res.status(500).json({ succes: false, erreur: error.message });
+    if (!reqSignal.signal.aborted && !res.writableEnded) {
+      res.status(500).json({ succes: false, erreur: error?.message || 'Erreur simulation temporelle.' });
+    }
+  } finally {
+    reqSignal.cleanup();
   }
 });
 
-app.post('/api/simulation/reset', (_req: Request, res: Response) => {
-  currentWorldState = JSON.parse(JSON.stringify(INITIAL_SIMULATION_STATE));
-  currentWorldState._seq = 1;
-  res.json({ succes: true, etat: currentWorldState });
+app.post('/api/world/generate', (req: Request, res: Response) => {
+  try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const body = req.body || {};
+
+    const seed = Math.max(1, Math.trunc(Number(body.seed) || Math.floor(Math.random() * 900000) + 10000));
+    const validTemplates: AzgaarTemplateId[] = [
+      'continent',
+      'archipel',
+      'peninsule',
+      'mediterranee',
+      'detroit',
+      'volcan',
+      'haute_chaine',
+    ];
+    let template: AzgaarTemplateId = 'continent';
+    if (validTemplates.includes(body.template)) {
+      template = body.template;
+    } else if (body.modeleRelief === 'archipel') {
+      template = 'archipel';
+    } else if (body.modeleRelief === 'peninsule') {
+      template = 'peninsule';
+    } else if (body.modeleRelief === 'monts') {
+      template = 'haute_chaine';
+    } else if (body.modeleRelief === 'vallee') {
+      template = 'mediterranee';
+    }
+
+    const climateBias = (['tempere', 'boreal', 'aride'].includes(String(body.climateBias || body.climatBias || ''))
+      ? String(body.climateBias || body.climatBias)
+      : 'tempere') as AzgaarClimateBias;
+    const cellsDesired = ([800, 1500, 2400].includes(Number(body.cellsDesired))
+      ? Number(body.cellsDesired)
+      : 1500) as 800 | 1500 | 2400;
+    const windAngle = Number.isFinite(Number(body.windAngle)) ? Number(body.windAngle) : undefined;
+    const stylePreset = (['classique', 'parchemin', 'politique', 'relief', 'sombre'].includes(String(body.stylePreset || ''))
+      ? String(body.stylePreset)
+      : etatCourant.azgaarStudio?.stylePreset || 'classique') as AzgaarStylePreset;
+    const rayonAnneaux = Math.max(2, Math.min(4, Math.trunc(Number(body.rayonAnneaux) || 2)));
+    const worldName = typeof (body.worldName || body.nomMonde) === 'string'
+      ? String(body.worldName || body.nomMonde).slice(0, 60)
+      : undefined;
+    const conserverHeros = body.conserverHeros !== false;
+
+    const nouveauMonde = genererMondeAzgaarStudio(
+      {
+        seed,
+        template,
+        climateBias,
+        cellsDesired,
+        windAngle,
+        stylePreset,
+        worldName,
+        rayonAnneaux,
+        statesCount: Number.isFinite(Number(body.statesCount)) ? Number(body.statesCount) : undefined,
+        culturesCount: Number.isFinite(Number(body.culturesCount)) ? Number(body.culturesCount) : undefined,
+        religionsCount: Number.isFinite(Number(body.religionsCount)) ? Number(body.religionsCount) : undefined,
+        burgsCount: Number.isFinite(Number(body.burgsCount)) ? Number(body.burgsCount) : undefined,
+        conserverHeros,
+      },
+      etatCourant
+    );
+    nouveauMonde.profilHydrogen = etatCourant.profilHydrogen || 'STANDARD';
+    const saved = globalSessionStore.setState(sessionId, nouveauMonde);
+    res.json({ succes: true, etat: saved });
+  } catch (err: any) {
+    res.status(400).json({ succes: false, erreur: err?.message || 'Génération impossible.' });
+  }
+});
+
+app.post('/api/azgaar/sync', (req: Request, res: Response) => {
+  try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const studio = req.body?.studio as AzgaarWorldState | undefined;
+    if (!studio || !Array.isArray(studio.states) || !Array.isArray(studio.burgs)) {
+      res.status(400).json({ succes: false, erreur: 'Carte Azgaar invalide.' });
+      return;
+    }
+    const synced = synchroniserSecteurDepuisAzgaar(etatCourant, studio);
+    const saved = globalSessionStore.setState(sessionId, synced);
+    res.json({ succes: true, etat: saved });
+  } catch (err: any) {
+    res.status(400).json({ succes: false, erreur: err?.message || 'Synchronisation impossible.' });
+  }
+});
+
+app.post('/api/azgaar/import', (req: Request, res: Response) => {
+  try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const rawText = typeof req.body?.rawText === 'string' ? req.body.rawText : '';
+    const studio = parserImportAzgaarJsonOuMap(rawText, etatCourant);
+    const nouveauMonde = projeterSimulationDepuisAzgaarStudio(studio, undefined, etatCourant);
+    nouveauMonde.profilHydrogen = etatCourant.profilHydrogen || 'STANDARD';
+    const saved = globalSessionStore.setState(sessionId, nouveauMonde);
+    res.json({ succes: true, etat: saved });
+  } catch (err: any) {
+    res.status(400).json({ succes: false, erreur: err?.message || 'Import .map / .json impossible.' });
+  }
+});
+
+app.post('/api/world/forge/init', (req: Request, res: Response) => {
+  try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const configOverride = req.body?.config && typeof req.body.config === 'object' ? req.body.config : undefined;
+    const draft = creerBrouillonForgeInitial(etatCourant, configOverride);
+    res.json({ succes: true, draft });
+  } catch (err: any) {
+    res.status(400).json({ succes: false, erreur: err?.message || 'Initialisation de la forge impossible.' });
+  }
+});
+
+app.post('/api/world/forge/step', async (req: Request, res: Response) => {
+  const reqSignal = lierSignalRequete(req, res);
+  try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const draft = req.body?.draft as WorldForgeDraft | undefined;
+    const stepRaw = Number(req.body?.step);
+    const step = ([1, 2, 3, 4].includes(stepRaw) ? stepRaw : 1) as WorldForgeStep;
+    const regenererGeometrie = Boolean(req.body?.regenererGeometrie);
+
+    if (!draft || !draft.studio || !draft.config) {
+      res.status(400).json({ succes: false, erreur: 'Brouillon de forge invalide.' });
+      return;
+    }
+
+    const result = await executerEtapeForgeServeur(
+      aiClient,
+      draft,
+      step,
+      etatCourant.personnage,
+      {
+        signal: reqSignal.signal,
+        timeoutMs: AI_TIMEOUT_MS,
+        regenererGeometrie,
+      }
+    );
+
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.json({ succes: true, ...result });
+    }
+  } catch (err: any) {
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.status(500).json({ succes: false, erreur: err?.message || 'Échec de l’étape de forge.' });
+    }
+  } finally {
+    reqSignal.cleanup();
+  }
+});
+
+app.post('/api/world/forge/apply', (req: Request, res: Response) => {
+  try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const draft = req.body?.draft as WorldForgeDraft | undefined;
+    if (!draft || !draft.studio || !draft.lore || !Array.isArray(draft.pnjs)) {
+      res.status(400).json({ succes: false, erreur: 'Brouillon de forge incomplet.' });
+      return;
+    }
+    const nouveauMonde = appliquerBrouillonForgeASimulation(draft, etatCourant);
+    nouveauMonde.profilHydrogen = etatCourant.profilHydrogen || 'STANDARD';
+    nouveauMonde.modeNarration = etatCourant.modeNarration || 'CONCIS';
+    const saved = globalSessionStore.setState(sessionId, nouveauMonde);
+    res.json({ succes: true, etat: saved });
+  } catch (err: any) {
+    res.status(400).json({ succes: false, erreur: err?.message || 'Application du monde impossible.' });
+  }
+});
+
+app.post('/api/world/npcs/promote', async (req: Request, res: Response) => {
+  const reqSignal = lierSignalRequete(req, res);
+  try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const npcIds = Array.isArray(req.body?.npcIds) ? req.body.npcIds.map(String) : undefined;
+    const result = await enrichirPnjsPromusServeur(aiClient, etatCourant, npcIds, {
+      signal: reqSignal.signal,
+      timeoutMs: AI_TIMEOUT_MS,
+    });
+
+    if (reqSignal.signal.aborted || res.writableEnded) return;
+    const saved = globalSessionStore.setState(sessionId, result.etat);
+    res.json({
+      succes: true,
+      etat: saved,
+      promotedOrEnrichedIds: result.promotedOrEnrichedIds,
+      source: result.source,
+    });
+  } catch (err: any) {
+    if (!reqSignal.signal.aborted && !res.writableEnded) {
+      res.status(500).json({ succes: false, erreur: err?.message || 'Promotion PNJ impossible.' });
+    }
+  } finally {
+    reqSignal.cleanup();
+  }
+});
+
+app.post('/api/world/mj', (req: Request, res: Response) => {
+  try {
+    const sessionId = obtenirSessionId(req);
+    const etatCourant = globalSessionStore.getState(sessionId);
+    const commande = req.body as MjWorldCommand | undefined;
+    if (!commande || !commande.type) {
+      res.status(400).json({ succes: false, erreur: 'Commande MJ invalide.' });
+      return;
+    }
+    const { etat: prochainEtat, resume } = appliquerCommandeMJMonde(etatCourant, commande);
+    const saved = globalSessionStore.setState(sessionId, prochainEtat);
+    res.json({ succes: true, etat: saved, resume });
+  } catch (err: any) {
+    res.status(400).json({ succes: false, erreur: err?.message || 'Action MJ impossible.' });
+  }
+});
+
+app.post('/api/narration/tts', async (req: Request, res: Response) => {
+  const reqSignal = lierSignalRequete(req, res);
+  try {
+    const body = req.body || {};
+    const texte = typeof body.texte === 'string' ? body.texte : '';
+    const titre = typeof body.titre === 'string' ? body.titre : '';
+    const tonRaw = typeof body.tonAmbiance === 'string' ? body.tonAmbiance : typeof body.ton === 'string' ? body.ton : undefined;
+    const ton = (['CHAMPETRE', 'SOMBRE', 'PERIL', 'NEUTRE'].includes(String(tonRaw)) ? tonRaw : undefined) as
+      | 'CHAMPETRE'
+      | 'SOMBRE'
+      | 'PERIL'
+      | 'NEUTRE'
+      | undefined;
+    if (!texte.trim()) {
+      res.status(400).json({ succes: false, erreur: 'Texte narratif requis.' });
+      return;
+    }
+    const result = await genererAudioScene(
+      aiClient,
+      {
+        sceneKey: typeof body.sceneId === 'string' ? body.sceneId : typeof body.sceneKey === 'string' ? body.sceneKey : undefined,
+        titre,
+        texte,
+        ton,
+      },
+      { signal: reqSignal.signal, timeoutMs: AI_TIMEOUT_MS }
+    );
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.json({ succes: true, ...result });
+    }
+  } catch (err: any) {
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.status(500).json({ succes: false, erreur: err?.message || 'Génération audio impossible.' });
+    }
+  } finally {
+    reqSignal.cleanup();
+  }
+});
+
+app.post('/api/narration/illustrate', async (req: Request, res: Response) => {
+  const reqSignal = lierSignalRequete(req, res);
+  try {
+    const body = req.body || {};
+    const titre = typeof body.titre === 'string' ? body.titre : 'Scène de campagne';
+    const texte = typeof body.texte === 'string' ? body.texte : '';
+    const tonRaw = typeof body.tonAmbiance === 'string' ? body.tonAmbiance : typeof body.ton === 'string' ? body.ton : undefined;
+    const ton = (['CHAMPETRE', 'SOMBRE', 'PERIL', 'NEUTRE'].includes(String(tonRaw)) ? tonRaw : undefined) as
+      | 'CHAMPETRE'
+      | 'SOMBRE'
+      | 'PERIL'
+      | 'NEUTRE'
+      | undefined;
+    if (!texte.trim() && !titre.trim()) {
+      res.status(400).json({ succes: false, erreur: 'Scène requise.' });
+      return;
+    }
+    const result = await genererIllustrationScene(
+      aiClient,
+      {
+        sceneKey:
+          typeof body.sceneId === 'string'
+            ? body.sceneId
+            : typeof body.sceneKey === 'string'
+            ? body.sceneKey
+            : `scene_${Date.now()}`,
+        titre,
+        texte,
+        ton,
+        lieuNom: typeof body.lieuNom === 'string' ? body.lieuNom : undefined,
+        terrain: typeof body.terrain === 'string' ? body.terrain : undefined,
+        biomeAzgaar: typeof body.biomeAzgaar === 'string' ? body.biomeAzgaar : undefined,
+        meteo: typeof body.meteo === 'string' ? body.meteo : undefined,
+        heure: typeof body.heure === 'number' ? body.heure : undefined,
+        enCombat: Boolean(body.enCombat),
+        enDonjon: Boolean(body.enDonjon),
+      },
+      { signal: reqSignal.signal, timeoutMs: AI_TIMEOUT_MS }
+    );
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.json({ succes: true, svg: result.svg, svgMarkup: result.svg, source: result.source });
+    }
+  } catch (err: any) {
+    if (!res.writableEnded && !reqSignal.signal.aborted) {
+      res.status(500).json({ succes: false, erreur: err?.message || 'Illustration impossible.' });
+    }
+  } finally {
+    reqSignal.cleanup();
+  }
+});
+
+app.post('/api/simulation/reset', (req: Request, res: Response) => {
+  const sessionId = obtenirSessionId(req);
+  const precedent = globalSessionStore.getState(sessionId);
+  const reset = globalSessionStore.resetState(sessionId);
+  reset.profilHydrogen = precedent.profilHydrogen || 'STANDARD';
+  globalSessionStore.setState(sessionId, reset);
+  res.json({ succes: true, etat: reset });
 });
 
 // Endpoint SSE avec déduplication _seq
@@ -567,8 +827,10 @@ app.get('/api/narration/stream', (req: Request, res: Response) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  const sinceSeq = parseInt(req.query.since_seq as string || '0', 10);
-  const eventsAEnvoyer = currentWorldState.journalNarratif.filter(e => e._seq > sinceSeq);
+  const sessionId = obtenirSessionId(req);
+  const etat = globalSessionStore.getState(sessionId);
+  const sinceSeq = parseInt((req.query.since_seq as string) || '0', 10);
+  const eventsAEnvoyer = etat.journalNarratif.filter(e => e._seq > sinceSeq);
 
   for (const evt of eventsAEnvoyer) {
     res.write(`id: ${evt._seq}\n`);
@@ -576,7 +838,6 @@ app.get('/api/narration/stream', (req: Request, res: Response) => {
     res.write(`data: ${JSON.stringify(evt)}\n\n`);
   }
 
-  // Interval heartbeat pour garder la connexion ouverte
   const heartbeat = setInterval(() => {
     res.write(': keepalive\n\n');
   }, 15000);
@@ -587,14 +848,25 @@ app.get('/api/narration/stream', (req: Request, res: Response) => {
 });
 
 async function demarrerServeur() {
+  const httpServer = http.createServer(app);
+  // Permet aux appels IA longs (jusqu'à 15 minutes + marge) de s'achever sans coupure HTTP prématurée
+  httpServer.requestTimeout = HTTP_SERVER_TIMEOUT_MS;
+  httpServer.setTimeout(HTTP_SERVER_TIMEOUT_MS);
+  const hmrDisabled = process.env.DISABLE_HMR === 'true';
+
   const vite = await createViteServer({
-    server: { middlewareMode: true },
+    server: {
+      middlewareMode: true,
+      allowedHosts: true,
+      hmr: hmrDisabled ? false : { server: httpServer },
+      ws: hmrDisabled ? { server: httpServer } : undefined,
+    },
     appType: 'spa',
   });
 
   app.use(vite.middlewares);
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Serveur D&D 5e Monde Indifférent actif sur http://0.0.0.0:${PORT}`);
   });
 }

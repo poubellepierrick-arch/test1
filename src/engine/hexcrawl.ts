@@ -9,6 +9,30 @@ export interface TravelResult {
   typeRencontre?: 'GOBELIN' | 'ZOMBIE' | 'BANDIT';
 }
 
+export function calculerDistanceHex(a: Pick<HexNode, 'q' | 'r'>, b: Pick<HexNode, 'q' | 'r'>): number {
+  const dq = Math.abs(a.q - b.q);
+  const dr = Math.abs(a.r - b.r);
+  const ds = Math.abs(a.q + a.r - (b.q + b.r));
+  return Math.max(dq, dr, ds);
+}
+
+export function estimerCoutTrajet(hexCible: HexNode, allure: Pace): { heures: number; eauLitres: number } {
+  let heures = 2;
+  if (hexCible.terrain === 'Plaine / Route') heures = 1.6;
+  if (hexCible.terrain === 'Marais Fétide' || hexCible.terrain === 'Montagne Escarpée') heures = 3;
+
+  if (hexCible.routeNiveau === 'ROUTE') heures *= 0.9;
+  else if (hexCible.routeNiveau === 'AUCUNE' && hexCible.terrain !== 'Plaine / Route') heures *= 1.1;
+
+  if (allure === 'Lente') heures *= 1.25;
+  if (allure === 'Rapide') heures *= 0.8;
+
+  const besoinEauHeure =
+    hexCible.terrain === 'Désert Aride' || (hexCible.temperatureC ?? 15) >= 28 ? 0.5 : 0.25;
+  const eauLitres = Number((heures * besoinEauHeure).toFixed(1));
+  return { heures: Number(heures.toFixed(1)), eauLitres };
+}
+
 export function obtenirDDNavigation(hex: HexNode): number {
   switch (hex.terrain) {
     case 'Plaine / Route': return 10;
@@ -41,22 +65,15 @@ export function executerDeplacementHex(
   hexCibleClone.visite = true;
   hexCibleClone.brouillard = 'EXPLORE';
 
-  // Calcul du temps de trajet (en heures) pour franchir 1 hex de 6 miles
-  // Plaine: ~1.6h. Forêt/Désert: ~2h. Montagne/Marais: ~3h.
-  let heures = 2;
-  if (hexCible.terrain === 'Plaine / Route') heures = 1.6;
-  if (hexCible.terrain === 'Marais Fétide' || hexCible.terrain === 'Montagne Escarpée') heures = 3;
-
-  if (allure === 'Lente') heures *= 1.25;
-  if (allure === 'Rapide') heures *= 0.8;
-
+  const { heures } = estimerCoutTrajet(hexCible, allure);
   persoClone.heuresMarcheJour += heures;
 
-  // Test de navigation si le rôle est S'orienter ou par défaut
+  // Test de navigation : allure lente donne +2, rapide -2 ; rôle S'orienter donne +2
   const modSag = calculerModificateur(persoClone.caracteristiques.SAG);
-  const bonusSurvie = persoClone.competencesMaitrisees.includes('Survie')
-    ? modSag + persoClone.bonusMaitrise
-    : modSag;
+  const bonusSurvie =
+    (persoClone.competencesMaitrisees.includes('Survie') ? modSag + persoClone.bonusMaitrise : modSag) +
+    (role === 'S\'orienter' ? 2 : 0) +
+    (allure === 'Lente' ? 2 : allure === 'Rapide' ? -2 : 0);
 
   // Niveau 1 d'épuisement confère désavantage
   const typeJet = persoClone.epuisement >= 1 ? 'desavantage' : 'normal';
@@ -71,6 +88,15 @@ export function executerDeplacementHex(
   const eauConsommee = Math.min(persoClone.eauLitres, Number((heures * besoinEauHeure).toFixed(1)));
   persoClone.eauLitres = Number(Math.max(0, persoClone.eauLitres - eauConsommee).toFixed(1));
 
+  // Rôle Forager en route : chance de glaner 1 ration en terrain fertile
+  let descRole = '';
+  if (role === 'Forager' && hexCible.ressourcesGibier && lancerD20('normal').valeurRetenue + modSag >= 14) {
+    if (persoClone.rationsJours < persoClone.rationsMaxJours) {
+      persoClone.rationsJours += 1;
+      descRole = ' [Forage en chemin : +1 ration]';
+    }
+  }
+
   // Effet Marais Fétide: eau polluée / risque de maladie
   let descTechnique = '';
   if (hexCible.terrain === 'Marais Fétide') {
@@ -84,10 +110,12 @@ export function executerDeplacementHex(
     }
   }
 
-  // Risque de rencontre aléatoire selon terrain et sécurité
+  // Risque de rencontre aléatoire selon terrain, sécurité et rôle Guetter / allure
   let rencontre = false;
   let typeRencontre: 'GOBELIN' | 'ZOMBIE' | 'BANDIT' | undefined = undefined;
-  const seuilRencontre = hexCible.securite === 'Dangereux' ? 12 : hexCible.securite === 'Périlleux' ? 8 : 17;
+  let seuilRencontre = hexCible.securite === 'Dangereux' ? 12 : hexCible.securite === 'Périlleux' ? 8 : 17;
+  if (role === 'Guetter') seuilRencontre += 2;
+  if (allure === 'Rapide') seuilRencontre -= 1;
   const tirageRencontre = lancerD20('normal').valeurRetenue;
 
   if (tirageRencontre >= seuilRencontre) {
@@ -97,7 +125,7 @@ export function executerDeplacementHex(
     else typeRencontre = 'BANDIT';
   }
 
-  descTechnique = `Navigation ${reussiteNav ? 'réussie' : 'égarée avec détour'} (${scoreNav} vs DD ${ddNav}). Déplacement de 6 miles vers ${hexCible.nom} (${heures.toFixed(1)}h). Eau consommée: -${eauConsommee}L.` + descTechnique;
+  descTechnique = `Navigation ${reussiteNav ? 'réussie' : 'égarée avec détour'} (${scoreNav} vs DD ${ddNav}, allure ${allure.toLowerCase()}). Trajet vers ${hexCible.nom} (${heures.toFixed(1)}h). Eau : -${eauConsommee}L.` + descRole + descTechnique;
 
   const adjudication: AdjudicationPayload = {
     phase: 'adjudication_resolved',
@@ -135,7 +163,14 @@ export function executerForage(hex: HexNode, joueur: CharacterStats): {
     ? modSag + persoClone.bonusMaitrise
     : modSag;
 
-  const ddForage = obtenirDDForage(hex);
+  const baseDD = obtenirDDForage(hex);
+  const ecologieTendu =
+    (typeof hex.populationGibier === 'number' && hex.populationGibier < 20) &&
+    (typeof hex.niveauEau === 'number' && hex.niveauEau < 20);
+  const ecologieRiche =
+    (hex.populationGibier ?? 0) >= 65 || (hex.fluxHydro ?? 0) >= 50;
+  const ddForage = Math.max(8, baseDD + (ecologieTendu ? 2 : ecologieRiche ? -1 : 0));
+
   const typeJet = persoClone.epuisement >= 1 ? 'desavantage' : 'normal';
   const jet = lancerD20(typeJet);
   const score = jet.valeurRetenue + bonusSurvie;
@@ -147,8 +182,12 @@ export function executerForage(hex: HexNode, joueur: CharacterStats): {
 
   if (reussite) {
     // SRD 5e: 1d6 + modificateur SAG en livres de nourriture + eau
-    rationsObtenues = Math.min(2, Math.floor(Math.random() * 2) + 1);
-    eauObtenue = Math.min(persoClone.eauMaxLitres - persoClone.eauLitres, 2);
+    rationsObtenues =
+      typeof hex.populationGibier === 'number' && hex.populationGibier < 10
+        ? 0
+        : Math.min(2, Math.floor(Math.random() * 2) + 1);
+    const eauCap = typeof hex.niveauEau === 'number' && hex.niveauEau < 12 ? 1 : 2;
+    eauObtenue = Math.min(persoClone.eauMaxLitres - persoClone.eauLitres, eauCap);
 
     persoClone.rationsJours = Math.min(persoClone.rationsMaxJours, persoClone.rationsJours + rationsObtenues);
     persoClone.eauLitres = Number(Math.min(persoClone.eauMaxLitres, persoClone.eauLitres + eauObtenue).toFixed(1));

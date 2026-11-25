@@ -26,8 +26,10 @@ export function lancerD20(type: 'normal' | 'avantage' | 'desavantage' = 'normal'
 }
 
 export function interpreterJetDegats(formule: string): number {
+  const propre = formule.replace(/\s+/g, '');
+  if (/^\d+$/.test(propre)) return Math.max(1, parseInt(propre, 10));
   // Ex: "1d6+2" ou "2d6" ou "1d8"
-  const match = formule.match(/^(\d+)d(\d+)(?:\+|-)?(\d+)?$/i);
+  const match = propre.match(/^(\d+)d(\d+)(?:\+|-)?(\d+)?$/i);
   if (!match) return lancerDe(6);
   const nbDes = parseInt(match[1], 10);
   const faces = parseInt(match[2], 10);

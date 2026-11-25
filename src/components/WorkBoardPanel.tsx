@@ -1,6 +1,7 @@
 import React from 'react';
 import { SimulationState } from '../types';
 import { ActionRequest } from '../engine/adjudication';
+import { evaluerContexteLieu } from '../engine/context';
 import { Hammer, Shield, Shovel, Compass } from 'lucide-react';
 
 interface WorkBoardPanelProps {
@@ -14,7 +15,7 @@ export const WorkBoardPanel: React.FC<WorkBoardPanelProps> = ({
   chargement,
   onExecuterAction,
 }) => {
-  const estEnBourgade = etat.hexActuel.pointInteret?.type === 'bourgade' || etat.hexActuel.securite === 'Sûr';
+  const ctx = evaluerContexteLieu(etat);
 
   const offres = [
     {
@@ -56,7 +57,7 @@ export const WorkBoardPanel: React.FC<WorkBoardPanelProps> = ({
     {
       id: 'chasse_ravitaillement',
       titre: 'Traque de subsistance',
-      desc: 'Gibier pour le camp',
+      desc: 'Gibier pour le bourg',
       test: 'SAG DD 13',
       duree: '3h',
       gain: '1 PO + 2 rations',
@@ -64,41 +65,49 @@ export const WorkBoardPanel: React.FC<WorkBoardPanelProps> = ({
     },
   ];
 
+  const offresFiltrees = offres.filter(o => ctx.offresCorveesIds.includes(o.id));
+
   return (
     <div className="space-y-2 text-xs">
       <div className="flex items-center justify-between text-stone-500 text-[11px]">
-        <span className="font-semibold uppercase tracking-wide">Offres de corvées & subsistance</span>
-        <span>{estEnBourgade ? 'Bourgade marchande' : 'Campement de fortune'}</span>
+        <span className="font-semibold uppercase tracking-wide">Corvées locales</span>
+        <span>{ctx.resumeLieu}</span>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-        {offres.map(offre => {
-          const Icon = offre.icon;
-          return (
-            <button
-              key={offre.id}
-              onClick={() => onExecuterAction({ type: 'CORVEE_TRAVAIL', jobId: offre.id })}
-              disabled={chargement}
-              className="text-left bg-stone-50 hover:bg-emerald-50/60 border border-stone-200 hover:border-emerald-300 p-2.5 rounded-lg transition-colors flex flex-col justify-between space-y-1.5 shadow-2xs cursor-pointer"
-            >
-              <div className="flex items-center justify-between">
-                <span className="font-bold text-stone-900 flex items-center gap-1.5">
-                  <Icon className="w-3.5 h-3.5 text-amber-700 shrink-0" />
-                  {offre.titre}
-                </span>
-                <span className="text-[10px] text-stone-600 bg-white px-1.5 py-0.2 rounded border border-stone-200 font-mono">
-                  {offre.test}
-                </span>
-              </div>
-              <div className="text-[11px] text-stone-600">{offre.desc}</div>
-              <div className="flex items-center justify-between text-[11px] pt-1.5 border-t border-stone-200/80 text-stone-500 font-mono">
-                <span>Durée : {offre.duree}</span>
-                <span className="text-emerald-800 font-bold">{offre.gain}</span>
-              </div>
-            </button>
-          );
-        })}
-      </div>
+      {offresFiltrees.length === 0 ? (
+        <div className="bg-stone-50 border border-stone-200 rounded-lg p-3 text-stone-500">
+          {ctx.raisonCorvees}
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {offresFiltrees.map(offre => {
+            const Icon = offre.icon;
+            return (
+              <button
+                key={offre.id}
+                onClick={() => onExecuterAction({ type: 'CORVEE_TRAVAIL', jobId: offre.id })}
+                disabled={chargement}
+                className="text-left bg-stone-50 hover:bg-emerald-50/60 border border-stone-200 hover:border-emerald-300 p-2.5 rounded-lg transition-colors flex flex-col justify-between space-y-1.5 shadow-2xs cursor-pointer"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-stone-900 flex items-center gap-1.5">
+                    <Icon className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                    {offre.titre}
+                  </span>
+                  <span className="text-[10px] text-stone-600 bg-white px-1.5 py-0.2 rounded border border-stone-200 font-mono">
+                    {offre.test}
+                  </span>
+                </div>
+                <div className="text-[11px] text-stone-600">{offre.desc}</div>
+                <div className="flex items-center justify-between text-[11px] pt-1.5 border-t border-stone-200/80 text-stone-500 font-mono">
+                  <span>Durée : {offre.duree}</span>
+                  <span className="text-emerald-800 font-bold">{offre.gain}</span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 };

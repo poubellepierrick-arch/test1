@@ -1,40 +1,294 @@
 import { Combatant, CombatState, CharacterStats, AdjudicationPayload } from '../types';
+import { ItemEntry } from '../types/srd';
 import { calculerModificateur, lancerD20, interpreterJetDegats } from './dice';
+import { obtenirFicheSrd } from './compendium';
+import { evaluerVitesseEffective, extraireProfilArme, obtenirArmeActive } from './character';
+import { appliquerUsureEquipement } from './srd';
+
+export interface CombatAttackOptions {
+  verifierPorteeStricte?: boolean;
+  dansObscurite?: boolean;
+}
 
 export function initialiserCombat(joueur: CharacterStats, ennemisInitiaux: Combatant[]): CombatState {
   const modDexJoueur = calculerModificateur(joueur.caracteristiques.DEX);
   const jetInitJoueur = lancerD20('normal').valeurRetenue + modDexJoueur;
 
+  const ennemisAvecInit = ennemisInitiaux.map(e => ({
+    ...e,
+    initiative: lancerD20('normal').valeurRetenue + 1,
+  }));
+
+  const alliesMercenaires = (joueur.compagnons || [])
+    .filter(c => c.type === 'MERCENAIRE' && c.pv > 0)
+    .map(c => ({
+      id: `ally:${c.id}`,
+      nom: c.nom,
+      initiative: lancerD20('normal').valeurRetenue + 1,
+    }));
+
   const listeCombattants = [
     { id: 'player', nom: joueur.nom, initiative: jetInitJoueur },
-    ...ennemisInitiaux.map(e => ({
+    ...alliesMercenaires,
+    ...ennemisAvecInit.map(e => ({
       id: e.id,
       nom: e.nom,
-      initiative: lancerD20('normal').valeurRetenue + 1,
+      initiative: e.initiative,
     })),
   ];
 
-  // Tri décroissant d'initiative
-  listeCombattants.sort((a, b) => b.initiative - a.initiative);
+  // Tri décroissant d'initiative (en cas d'égalité, joueur prioritaire)
+  listeCombattants.sort((a, b) => {
+    if (b.initiative !== a.initiative) return b.initiative - a.initiative;
+    if (a.id === 'player') return -1;
+    if (b.id === 'player') return 1;
+    return 0;
+  });
+
   const ordre = listeCombattants.map(c => c.id);
+  const initiatives: Record<string, number> = {};
+  for (const c of listeCombattants) {
+    initiatives[c.id] = c.initiative;
+  }
 
   return {
     actif: true,
     round: 1,
     combattantActifIndex: 0,
     ordreInitiative: ordre,
-    ennemis: ennemisInitiaux,
+    ennemis: ennemisAvecInit,
     journalCombat: [
-      `Combat engagé. Initiative du joueur : ${jetInitJoueur}. Ordre : ${listeCombattants.map(c => `${c.nom} (${c.initiative})`).join(', ')}`,
+      `Combat engagé. Initiative : ${listeCombattants.map(c => `${c.nom} (${c.initiative})`).join(', ')}.`,
     ],
+    postureDefensive: false,
+    actionDisponible: true,
+    actionBonusDisponible: true,
+    mouvementRestantPieds: evaluerVitesseEffective(joueur),
+    desengage: false,
+    initiatives,
   };
 }
 
-export function executerAttaqueJoueur(
+function executerAttaqueAllieMercenaire(
+  allyId: string,
+  persoClone: CharacterStats,
+  combatClone: CombatState
+): string | null {
+  const hirelingId = allyId.replace(/^ally:/, '');
+  const mercenaire = (persoClone.compagnons || []).find(c => c.id === hirelingId && c.pv > 0);
+  const cible = combatClone.ennemis.find(e => e.statut === 'ACTIF');
+  if (!mercenaire || !cible) return null;
+
+  const bonusAtk = mercenaire.bonusAttaque ?? 3;
+  const jet = lancerD20('normal');
+  const total = jet.valeurRetenue + bonusAtk;
+
+  if (jet.valeurRetenue === 20 || (jet.valeurRetenue !== 1 && total >= cible.ca)) {
+    let degats = interpreterJetDegats('1d8+2');
+    if (jet.valeurRetenue === 20) degats += interpreterJetDegats('1d8');
+    cible.pv = Math.max(0, cible.pv - degats);
+    let msg = `${mercenaire.nom} frappe ${cible.nom} (${total} vs CA ${cible.ca}) : ${degats} dégâts.`;
+    if (cible.pv === 0) {
+      cible.statut = 'MORT';
+      const xpGain = cible.xp || 0;
+      if (xpGain > 0) persoClone.experience += xpGain;
+      msg += ` ${cible.nom} tombe${xpGain > 0 ? ` (+${xpGain} XP)` : ''}.`;
+    }
+    combatClone.journalCombat.push(msg);
+    return msg;
+  } else {
+    const msg = `${mercenaire.nom} attaque ${cible.nom} et manque (${total} vs CA ${cible.ca}).`;
+    combatClone.journalCombat.push(msg);
+    return msg;
+  }
+}
+
+function attaquerCibleAvecEnnemi(
+  ennemieEnCours: Combatant,
+  persoClone: CharacterStats,
+  combatClone: CombatState,
+  typeJetEnnemi: 'normal' | 'avantage' | 'desavantage',
+  contexte?: string
+): { desc: string; degatsInfliges: number; issue: AdjudicationPayload['issue']; jet: number; bonusAtk: number; total: number } {
+  const attaquesDisponibles = (ennemieEnCours.attaques || []).filter(a => typeof a.bonusAttaque === 'number' && a.degatsDes);
+  const attaqueChoisie = attaquesDisponibles.length > 0
+    ? attaquesDisponibles[Math.floor(Math.random() * attaquesDisponibles.length)]
+    : undefined;
+
+  const bonusAtk = attaqueChoisie?.bonusAttaque ?? ennemieEnCours.bonusAttaque;
+  const formDegats = attaqueChoisie?.degatsDes ?? ennemieEnCours.degatsDes;
+  const nomAtk = attaqueChoisie?.nom;
+  const typeDegAtk = attaqueChoisie?.typeDegats ?? ennemieEnCours.typeDegats;
+
+  const jet = lancerD20(typeJetEnnemi);
+  const scoreTouche = jet.valeurRetenue + bonusAtk;
+  const caJoueur = persoClone.ca;
+  let degatsInfliges = 0;
+  let issue: AdjudicationPayload['issue'] = 'FAILURE';
+  let desc = '';
+
+  if (jet.valeurRetenue === 20 || (jet.valeurRetenue !== 1 && scoreTouche >= caJoueur)) {
+    issue = jet.valeurRetenue === 20 ? 'CRITICAL_SUCCESS' : 'SUCCESS';
+    degatsInfliges = interpreterJetDegats(formDegats);
+    if (jet.valeurRetenue === 20) degatsInfliges += interpreterJetDegats(formDegats);
+
+    persoClone.pvActuels = Math.max(0, persoClone.pvActuels - degatsInfliges);
+    desc = `${ennemieEnCours.nom}${contexte ? ` (${contexte})` : ''}${nomAtk ? ` [${nomAtk}]` : ''} touche ${persoClone.nom} (${scoreTouche} vs CA ${caJoueur}) : ${degatsInfliges} dégâts${typeDegAtk ? ` (${typeDegAtk})` : ''}. (PV : ${persoClone.pvActuels}/${persoClone.pvMax})`;
+
+    if (persoClone.pvActuels === 0) {
+      desc += ` ${persoClone.nom} tombe à 0 PV (jets de mort requis).`;
+      if (!persoClone.conditions.includes('Inconscient')) {
+        persoClone.conditions.push('Inconscient');
+      }
+    }
+  } else {
+    desc = `${ennemieEnCours.nom}${contexte ? ` (${contexte})` : ''} rate ${persoClone.nom} (${scoreTouche} vs CA ${caJoueur}${typeJetEnnemi === 'desavantage' ? ' · désavantage' : ''}).`;
+  }
+
+  return { desc, degatsInfliges, issue, jet: jet.valeurRetenue, bonusAtk, total: scoreTouche };
+}
+
+/**
+ * Résout automatiquement tous les tours des PNJ (alliés et ennemis) selon `ordreInitiative`
+ * jusqu'à ce que le curseur revienne sur `'player'` (ou fin de combat).
+ */
+export function resoudreToursJusquaJoueur(
   joueur: CharacterStats,
   combat: CombatState,
-  cibleId: string,
-  arme: { nom: string; degats: string; type: 'cac' | 'distance' }
+  options?: { estDebutCombat?: boolean }
+): {
+  combatModifie: CombatState;
+  personnageModifie: CharacterStats;
+  adjudication: AdjudicationPayload;
+} {
+  const combatClone: CombatState = JSON.parse(JSON.stringify(combat));
+  let persoClone: CharacterStats = JSON.parse(JSON.stringify(joueur));
+  const ordre = combatClone.ordreInitiative.length > 0 ? combatClone.ordreInitiative : ['player', ...combatClone.ennemis.map(e => e.id)];
+
+  const resumeTours: string[] = [];
+  let totalDegatsSubis = 0;
+  let dernierJet = 10;
+  let dernierBonus = 0;
+  let dernierScore = 10;
+  let caRef = persoClone.ca;
+
+  // Si on vient de finir le tour du joueur, avancer d'un cran après 'player'
+  let idx = combatClone.combattantActifIndex || 0;
+  if (!options?.estDebutCombat && ordre[idx] === 'player') {
+    idx += 1;
+    if (idx >= ordre.length) {
+      idx = 0;
+      combatClone.round += 1;
+    }
+  }
+
+  let securite = 0;
+  const maxSteps = ordre.length * 2 + 2;
+
+  while (combatClone.actif && securite < maxSteps) {
+    securite += 1;
+    const acteurId = ordre[idx];
+
+    if (acteurId === 'player') {
+      // Début du tour du joueur : réinitialisation de sa posture défensive et de son économie d'action
+      combatClone.combattantActifIndex = idx;
+      combatClone.postureDefensive = false;
+      combatClone.actionDisponible = true;
+      combatClone.actionBonusDisponible = true;
+      combatClone.mouvementRestantPieds = evaluerVitesseEffective(persoClone);
+      combatClone.desengage = false;
+      break;
+    }
+
+    if (acteurId.startsWith('ally:')) {
+      const msg = executerAttaqueAllieMercenaire(acteurId, persoClone, combatClone);
+      if (msg) resumeTours.push(msg);
+      if (!combatClone.ennemis.some(e => e.statut === 'ACTIF')) {
+        combatClone.actif = false;
+        combatClone.journalCombat.push('Victoire : tous les ennemis sont neutralisés.');
+        break;
+      }
+    } else {
+      const ennemi = combatClone.ennemis.find(e => e.id === acteurId);
+      if (ennemi && ennemi.statut === 'ACTIF' && persoClone.pvActuels > 0) {
+        if (ennemi.comportement === 'RUSE_ET_FUITE' && ennemi.pv <= ennemi.pvMax * 0.3) {
+          ennemi.statut = 'FUITE';
+          const msgFuite = `${ennemi.nom} se désengage et fuit le combat.`;
+          combatClone.journalCombat.push(msgFuite);
+          resumeTours.push(msgFuite);
+        } else {
+          // Mouvement ennemi vers le joueur s'il est hors de mêlée (30 ft/tour)
+          const aAttaqueDistance = (ennemi.attaques || []).some(a => /arc|arbal|javel|fronde|distance/i.test(a.nom + ' ' + a.desc));
+          if (ennemi.distancePieds > 5 && !aAttaqueDistance) {
+            const avance = Math.min(30, ennemi.distancePieds - 5);
+            ennemi.distancePieds -= avance;
+            if (avance > 0) {
+              combatClone.journalCombat.push(`${ennemi.nom} avance de ${avance} ft (distance : ${ennemi.distancePieds} ft).`);
+            }
+          }
+
+          if (ennemi.distancePieds <= 5 || aAttaqueDistance) {
+            const typeJet = combatClone.postureDefensive ? 'desavantage' : 'normal';
+            const atk = attaquerCibleAvecEnnemi(ennemi, persoClone, combatClone, typeJet);
+            combatClone.journalCombat.push(atk.desc);
+            resumeTours.push(atk.desc);
+            totalDegatsSubis += atk.degatsInfliges;
+            dernierJet = atk.jet;
+            dernierBonus = atk.bonusAtk;
+            dernierScore = atk.total;
+            caRef = persoClone.ca;
+            if (atk.degatsInfliges > 0) {
+              persoClone = appliquerUsureEquipement(persoClone, 2);
+            }
+          }
+        }
+      }
+    }
+
+    if (!combatClone.ennemis.some(e => e.statut === 'ACTIF')) {
+      combatClone.actif = false;
+      combatClone.journalCombat.push('Victoire : tous les adversaires sont neutralisés.');
+      break;
+    }
+
+    idx += 1;
+    if (idx >= ordre.length) {
+      idx = 0;
+      combatClone.round += 1;
+    }
+  }
+
+  combatClone.combattantActifIndex = idx;
+
+  const desc =
+    resumeTours.length > 0
+      ? resumeTours.join(' ')
+      : `Round ${combatClone.round} : au tour de ${persoClone.nom}.`;
+
+  const adjudication: AdjudicationPayload = {
+    phase: 'adjudication_resolved',
+    action_type: 'ATTACK',
+    competenceOuCarac: `Initiative Round ${combatClone.round}`,
+    dice_roll: dernierJet,
+    modificateur: dernierBonus,
+    score_total: dernierScore,
+    cible_dd_ou_ca: caRef,
+    issue: totalDegatsSubis > 0 ? 'SUCCESS' : 'FAILURE',
+    mutations_etat: {
+      pvDelta: totalDegatsSubis > 0 ? -totalDegatsSubis : undefined,
+      degatsInfliges: totalDegatsSubis > 0 ? totalDegatsSubis : undefined,
+      descriptionTechnique: desc,
+    },
+  };
+
+  return { combatModifie: combatClone, personnageModifie: persoClone, adjudication };
+}
+
+export function executerDeplacementCombat(
+  joueur: CharacterStats,
+  combat: CombatState,
+  direction: 'rapprocher' | 'eloigner',
+  cibleId?: string
 ): {
   combatModifie: CombatState;
   personnageModifie: CharacterStats;
@@ -42,6 +296,125 @@ export function executerAttaqueJoueur(
 } {
   const combatClone: CombatState = JSON.parse(JSON.stringify(combat));
   const persoClone: CharacterStats = JSON.parse(JSON.stringify(joueur));
+  const mvtDispo = combatClone.mouvementRestantPieds ?? evaluerVitesseEffective(persoClone);
+
+  if (mvtDispo < 5) {
+    throw new Error('Mouvement épuisé pour ce tour.');
+  }
+
+  const cible =
+    combatClone.ennemis.find(e => e.id === cibleId && e.statut === 'ACTIF') ||
+    combatClone.ennemis.find(e => e.statut === 'ACTIF');
+
+  if (!cible) {
+    throw new Error('Aucun adversaire actif.');
+  }
+
+  const notes: string[] = [];
+  let degatsOpportunite = 0;
+
+  if (direction === 'rapprocher') {
+    if (cible.distancePieds <= 5) {
+      throw new Error(`${cible.nom} est déjà au corps-à-corps (5 ft).`);
+    }
+    const delta = Math.min(mvtDispo, Math.max(5, cible.distancePieds - 5));
+    cible.distancePieds = Math.max(5, cible.distancePieds - delta);
+    combatClone.mouvementRestantPieds = Math.max(0, mvtDispo - delta);
+    notes.push(`${persoClone.nom} s'approche de ${cible.nom} (-${delta} ft → ${cible.distancePieds} ft).`);
+  } else {
+    // S'éloigner : vérifie l'Attaque d'Opportunité SRD 5e pour tout ennemi actif à <= 5 ft si non désengagé
+    const ennemisAuContact = combatClone.ennemis.filter(e => e.statut === 'ACTIF' && e.distancePieds <= 5);
+    if (ennemisAuContact.length > 0 && !combatClone.desengage) {
+      for (const enn of ennemisAuContact) {
+        const typeJet = combatClone.postureDefensive ? 'desavantage' : 'normal';
+        const atk = attaquerCibleAvecEnnemi(enn, persoClone, combatClone, typeJet, 'Opportunité');
+        notes.push(atk.desc);
+        degatsOpportunite += atk.degatsInfliges;
+      }
+    }
+    const pasRecul = Math.min(mvtDispo, 15);
+    for (const enn of combatClone.ennemis.filter(e => e.statut === 'ACTIF')) {
+      enn.distancePieds = Math.min(120, enn.distancePieds + pasRecul);
+    }
+    combatClone.mouvementRestantPieds = Math.max(0, mvtDispo - pasRecul);
+    notes.push(
+      `${persoClone.nom} recule de ${pasRecul} ft${combatClone.desengage ? ' (désengagé sans riposte)' : ''} → ${cible.distancePieds} ft.`
+    );
+  }
+
+  const desc = notes.join(' ');
+  combatClone.journalCombat.push(desc);
+
+  const adjudication: AdjudicationPayload = {
+    phase: 'adjudication_resolved',
+    action_type: 'COMBAT_MOVEMENT',
+    competenceOuCarac: direction === 'rapprocher' ? 'Mouvement tactique (Approche)' : 'Mouvement tactique (Repli)',
+    dice_roll: 10,
+    modificateur: 0,
+    score_total: 10,
+    cible_dd_ou_ca: 0,
+    issue: 'SUCCESS',
+    mutations_etat: {
+      pvDelta: degatsOpportunite > 0 ? -degatsOpportunite : undefined,
+      descriptionTechnique: desc,
+    },
+  };
+
+  return { combatModifie: combatClone, personnageModifie: persoClone, adjudication };
+}
+
+export function executerDesengagementJoueur(
+  joueur: CharacterStats,
+  combat: CombatState
+): {
+  combatModifie: CombatState;
+  personnageModifie: CharacterStats;
+  adjudication: AdjudicationPayload;
+} {
+  if (combat.actionDisponible === false) {
+    throw new Error('Action déjà dépensée ce tour.');
+  }
+  const combatClone: CombatState = JSON.parse(JSON.stringify(combat));
+  combatClone.desengage = true;
+  combatClone.actionDisponible = false;
+
+  const desc = `${joueur.nom} se désengage (Action SRD 5e) : aucune attaque d'opportunité subie lors du repli ce tour.`;
+  combatClone.journalCombat.push(desc);
+
+  const adjudication: AdjudicationPayload = {
+    phase: 'adjudication_resolved',
+    action_type: 'DEFENSIVE_STANCE',
+    competenceOuCarac: 'Se désengager (Action)',
+    dice_roll: 20,
+    modificateur: 0,
+    score_total: 20,
+    cible_dd_ou_ca: 0,
+    issue: 'SUCCESS',
+    mutations_etat: {
+      descriptionTechnique: desc,
+    },
+  };
+
+  return { combatModifie: combatClone, personnageModifie: JSON.parse(JSON.stringify(joueur)), adjudication };
+}
+
+export function executerAttaqueJoueur(
+  joueur: CharacterStats,
+  combat: CombatState,
+  cibleId: string,
+  arme: { nom: string; degats: string; type: 'cac' | 'distance' },
+  options?: CombatAttackOptions
+): {
+  combatModifie: CombatState;
+  personnageModifie: CharacterStats;
+  adjudication: AdjudicationPayload;
+} {
+  if (combat.actionDisponible === false) {
+    throw new Error('Action déjà dépensée ce tour. Terminez votre tour ou utilisez votre mouvement.');
+  }
+
+  const combatClone: CombatState = JSON.parse(JSON.stringify(combat));
+  let persoClone: CharacterStats = JSON.parse(JSON.stringify(joueur));
   const cibleIndex = combatClone.ennemis.findIndex(e => e.id === cibleId);
 
   if (cibleIndex === -1) {
@@ -49,15 +422,84 @@ export function executerAttaqueJoueur(
   }
 
   const cible = combatClone.ennemis[cibleIndex];
-  const modAttaque = arme.type === 'distance'
-    ? calculerModificateur(persoClone.caracteristiques.DEX)
-    : calculerModificateur(persoClone.caracteristiques.FOR);
-  const bonusTotal = modAttaque + persoClone.bonusMaitrise;
 
-  // Épuisement niveau 3 donne désavantage aux attaques
+  // Résolution de l'arme équipée réelle du personnage
+  let nomArme = arme.nom;
+  let degatsArme = arme.degats;
+  let typeDegatsArme: string | undefined = arme.type === 'distance' ? 'perforant' : 'tranchant';
+  let estDistance = arme.type === 'distance';
+  let estFinesse = false;
+  let porteeMaxPieds = estDistance ? 80 : 5;
+  let malusUsure = 0;
+
+  const armeEquipee = persoClone.inventaire.find(i => {
+    if (!i.estEquipe) return false;
+    if (i.degats || i.categorie === 'arme') return true;
+    const profil = extraireProfilArme(i, persoClone.usureEquipement);
+    if (profil.estArme) return true;
+    if (i.compendiumId) {
+      const f = obtenirFicheSrd(i.compendiumId);
+      return f?.categorie === 'objet' && f.sousCategorie === 'arme';
+    }
+    const fParNom = obtenirFicheSrd(i.nom);
+    return fParNom?.categorie === 'objet' && fParNom.sousCategorie === 'arme';
+  });
+
+  if (armeEquipee && arme.nom === 'Épée bâtarde') {
+    const profil = obtenirArmeActive(persoClone);
+    const ficheArme = (armeEquipee.compendiumId ? obtenirFicheSrd(armeEquipee.compendiumId) : obtenirFicheSrd(armeEquipee.nom)) as ItemEntry | undefined;
+    nomArme = armeEquipee.nom;
+    const baseDegats = armeEquipee.degats || ficheArme?.degats || profil.degatsBase;
+    const props = armeEquipee.proprietesArme || ficheArme?.proprietesArme || [];
+    typeDegatsArme = armeEquipee.typeDegats || ficheArme?.typeDegats || profil.typeDegats || typeDegatsArme;
+    estDistance = profil.estDistance || props.some(p => p.toLowerCase().includes('distance'));
+    estFinesse = profil.estFinesse || props.some(p => p.toLowerCase().includes('finesse'));
+    porteeMaxPieds = estDistance ? profil.porteeLonguePieds : 5;
+    malusUsure = profil.malusUsure;
+
+    if (baseDegats) {
+      const modCaracDeg = estDistance
+        ? calculerModificateur(persoClone.caracteristiques.DEX)
+        : estFinesse
+        ? Math.max(calculerModificateur(persoClone.caracteristiques.FOR), calculerModificateur(persoClone.caracteristiques.DEX))
+        : calculerModificateur(persoClone.caracteristiques.FOR);
+      const totalModDeg = modCaracDeg + malusUsure;
+      degatsArme = totalModDeg >= 0 ? `${baseDegats}+${totalModDeg}` : `${baseDegats}${totalModDeg}`;
+    }
+  }
+
+  // Vérification stricte de portée en jeu D&D 5e
+  if (options?.verifierPorteeStricte) {
+    if (!estDistance && cible.distancePieds > 5) {
+      throw new Error(
+        `${cible.nom} est à ${cible.distancePieds} ft : hors de portée de mêlée (5 ft). Approchez-vous d'abord.`
+      );
+    }
+    if (estDistance && cible.distancePieds > porteeMaxPieds) {
+      throw new Error(`${cible.nom} est à ${cible.distancePieds} ft (portée max ${porteeMaxPieds} ft).`);
+    }
+  }
+
+  const modFor = calculerModificateur(persoClone.caracteristiques.FOR);
+  const modDex = calculerModificateur(persoClone.caracteristiques.DEX);
+  const modAttaque = estDistance ? modDex : estFinesse ? Math.max(modFor, modDex) : modFor;
+  const bonusTotal = modAttaque + persoClone.bonusMaitrise + malusUsure;
+
+  // Désavantage : épuisement >= 3, obscurité sans vision/lumière, ou tir à distance au contact (5 ft)
+  const ennemiAuContact = combatClone.ennemis.some(e => e.statut === 'ACTIF' && e.distancePieds <= 5);
   let typeJet: 'normal' | 'avantage' | 'desavantage' = 'normal';
+  const raisonsDesavantage: string[] = [];
   if (persoClone.epuisement >= 3) {
     typeJet = 'desavantage';
+    raisonsDesavantage.push('épuisement');
+  }
+  if (options?.dansObscurite) {
+    typeJet = 'desavantage';
+    raisonsDesavantage.push('obscurité');
+  }
+  if (estDistance && ennemiAuContact) {
+    typeJet = 'desavantage';
+    raisonsDesavantage.push('tir au contact');
   }
 
   const jet = lancerD20(typeJet);
@@ -69,24 +511,37 @@ export function executerAttaqueJoueur(
   let desc = '';
 
   if (jet.valeurRetenue === 20 || (jet.valeurRetenue !== 1 && totalTouche >= caCible)) {
-    // Touche !
     const estCritique = jet.valeurRetenue === 20;
     issue = estCritique ? 'CRITICAL_SUCCESS' : 'SUCCESS';
-    degatsInfliges = interpreterJetDegats(arme.degats);
-    if (estCritique) degatsInfliges += interpreterJetDegats(arme.degats);
+    degatsInfliges = Math.max(1, interpreterJetDegats(degatsArme));
+    if (estCritique) degatsInfliges += Math.max(1, interpreterJetDegats(degatsArme));
+
+    if (typeDegatsArme && cible.vulnerabilites?.some(v => v.toLowerCase().includes(typeDegatsArme!.toLowerCase()))) {
+      degatsInfliges *= 2;
+    } else if (typeDegatsArme && cible.resistances?.some(r => r.toLowerCase().includes(typeDegatsArme!.toLowerCase()))) {
+      degatsInfliges = Math.max(1, Math.floor(degatsInfliges / 2));
+    }
 
     cible.pv = Math.max(0, cible.pv - degatsInfliges);
-    desc = `${persoClone.nom} touche ${cible.nom} (${totalTouche} vs CA ${caCible}) et inflige ${degatsInfliges} dégâts. (PV restants : ${cible.pv}/${cible.pvMax})`;
+    desc = `${persoClone.nom} touche ${cible.nom} avec ${nomArme} (${totalTouche} vs CA ${caCible}${malusUsure < 0 ? `, usure ${malusUsure}` : ''}${raisonsDesavantage.length ? `, désavantage: ${raisonsDesavantage.join('/')}` : ''}) et inflige ${degatsInfliges} dégâts${typeDegatsArme ? ` (${typeDegatsArme})` : ''}. (PV : ${cible.pv}/${cible.pvMax})`;
 
     if (cible.pv === 0) {
       cible.statut = 'MORT';
-      desc += ` ${cible.nom} s'effondre, sans vie.`;
+      const xpGain = cible.xp || 0;
+      if (xpGain > 0) {
+        persoClone.experience += xpGain;
+        desc += ` ${cible.nom} s'effondre (+${xpGain} XP).`;
+      } else {
+        desc += ` ${cible.nom} s'effondre, sans vie.`;
+      }
     }
   } else {
-    desc = `${persoClone.nom} rate ${cible.nom} (${totalTouche} vs CA ${caCible}).`;
+    desc = `${persoClone.nom} rate ${cible.nom} avec ${nomArme} (${totalTouche} vs CA ${caCible}${raisonsDesavantage.length ? `, désavantage: ${raisonsDesavantage.join('/')}` : ''}).`;
   }
 
+  combatClone.actionDisponible = false;
   combatClone.journalCombat.push(desc);
+  persoClone = appliquerUsureEquipement(persoClone, 2);
 
   // Vérifier si tous les ennemis sont morts ou en fuite
   const ennemisActifs = combatClone.ennemis.filter(e => e.statut === 'ACTIF');
@@ -98,7 +553,7 @@ export function executerAttaqueJoueur(
   const adjudication: AdjudicationPayload = {
     phase: 'adjudication_resolved',
     action_type: 'ATTACK',
-    competenceOuCarac: `Attaque ${arme.nom}`,
+    competenceOuCarac: `Attaque ${nomArme}`,
     dice_roll: jet.valeurRetenue,
     type_lancer: typeJet,
     modificateur: bonusTotal,
@@ -144,16 +599,9 @@ export function executerTourEnnemi(
     };
   }
 
-  // IA Comportementale déterministe
-  let desc = '';
-  let degatsInfliges = 0;
-  let issue: AdjudicationPayload['issue'] = 'FAILURE';
-
   if (ennemieEnCours.comportement === 'RUSE_ET_FUITE' && ennemieEnCours.pv <= ennemieEnCours.pvMax * 0.3) {
-    // Gobelin fuit si blessé gravement
     ennemieEnCours.statut = 'FUITE';
-    desc = `${ennemieEnCours.nom} prend panique, utilise son action bonus pour se désengager et détale dans les fourrés.`;
-    issue = 'SUCCESS';
+    const desc = `${ennemieEnCours.nom} prend panique, utilise son action bonus pour se désengager et détale dans les fourrés.`;
     combatClone.journalCombat.push(desc);
 
     const adjudication: AdjudicationPayload = {
@@ -169,47 +617,25 @@ export function executerTourEnnemi(
     return { combatModifie: combatClone, personnageModifie: persoClone, adjudication };
   }
 
-  // Attaque standard de l'ennemi (Désavantage si le joueur a esquivé)
   const typeJetEnnemi = combatClone.postureDefensive ? 'desavantage' : 'normal';
-  const jet = lancerD20(typeJetEnnemi);
-  combatClone.postureDefensive = false; // Réinitialisation de la posture après attaque
-  const scoreTouche = jet.valeurRetenue + ennemieEnCours.bonusAttaque;
-  const caJoueur = persoClone.ca;
-
-  if (jet.valeurRetenue === 20 || (jet.valeurRetenue !== 1 && scoreTouche >= caJoueur)) {
-    issue = jet.valeurRetenue === 20 ? 'CRITICAL_SUCCESS' : 'SUCCESS';
-    degatsInfliges = interpreterJetDegats(ennemieEnCours.degatsDes);
-    if (jet.valeurRetenue === 20) degatsInfliges += interpreterJetDegats(ennemieEnCours.degatsDes);
-
-    persoClone.pvActuels = Math.max(0, persoClone.pvActuels - degatsInfliges);
-    desc = `${ennemieEnCours.nom} frappe ${persoClone.nom} (${scoreTouche} vs CA ${caJoueur}) et inflige ${degatsInfliges} dégâts. (PV Joueur : ${persoClone.pvActuels}/${persoClone.pvMax})`;
-
-    if (persoClone.pvActuels === 0) {
-      desc += ` ${persoClone.nom} s'écroule à 0 PV. Début des jets de sauvegarde contre la mort.`;
-      if (!persoClone.conditions.includes('Inconscient')) {
-        persoClone.conditions.push('Inconscient');
-      }
-    }
-  } else {
-    desc = `${ennemieEnCours.nom} tente une frappe mais rate ${persoClone.nom} (${scoreTouche} vs CA ${caJoueur}${typeJetEnnemi === 'desavantage' ? ' sous esquive' : ''}).`;
-  }
-
-  combatClone.journalCombat.push(desc);
+  combatClone.postureDefensive = false;
+  const atk = attaquerCibleAvecEnnemi(ennemieEnCours, persoClone, combatClone, typeJetEnnemi);
+  combatClone.journalCombat.push(atk.desc);
 
   const adjudication: AdjudicationPayload = {
     phase: 'adjudication_resolved',
     action_type: 'ATTACK',
     competenceOuCarac: `Attaque ennemie (${ennemi.nom})`,
-    dice_roll: jet.valeurRetenue,
+    dice_roll: atk.jet,
     type_lancer: typeJetEnnemi,
-    modificateur: ennemieEnCours.bonusAttaque,
-    score_total: scoreTouche,
-    cible_dd_ou_ca: caJoueur,
-    issue,
+    modificateur: atk.bonusAtk,
+    score_total: atk.total,
+    cible_dd_ou_ca: persoClone.ca,
+    issue: atk.issue,
     mutations_etat: {
-      degatsInfliges,
-      pvDelta: -degatsInfliges,
-      descriptionTechnique: desc,
+      degatsInfliges: atk.degatsInfliges,
+      pvDelta: -atk.degatsInfliges,
+      descriptionTechnique: atk.desc,
     },
   };
 
@@ -224,8 +650,12 @@ export function executerEsquiveJoueur(
   personnageModifie: CharacterStats;
   adjudication: AdjudicationPayload;
 } {
+  if (combat.actionDisponible === false) {
+    throw new Error('Action déjà dépensée ce tour.');
+  }
   const combatClone: CombatState = JSON.parse(JSON.stringify(combat));
   combatClone.postureDefensive = true;
+  combatClone.actionDisponible = false;
   const desc = `${joueur.nom} adopte une posture défensive (Esquive SRD 5e). Les assauts ennemis subiront un désavantage.`;
   combatClone.journalCombat.push(desc);
 
@@ -259,7 +689,6 @@ export function executerSortJoueur(
   const combatClone: CombatState = JSON.parse(JSON.stringify(combat));
   const persoClone: CharacterStats = JSON.parse(JSON.stringify(joueur));
 
-  // Vérifier et consommer l'emplacement
   const slotDispo = persoClone.emplacementsSorts.find(s => s.total - s.utilise > 0);
   if (!slotDispo) {
     throw new Error('Aucun emplacement de sort disponible pour lancer un sort.');
@@ -282,7 +711,6 @@ export function executerSortJoueur(
     desc = `${persoClone.nom} canalise une étincelle curative : +${soinDelta} PV récupérés. Emplacement de sort niveau ${slotDispo.niveau} dépensé.`;
     jetTotal = soin;
   } else {
-    // Sort offensif (par ex: Trait de feu / Décharge occulte)
     const cible = combatClone.ennemis.find(e => e.id === cibleId) || combatClone.ennemis.find(e => e.statut === 'ACTIF');
     if (!cible) {
       throw new Error('Aucune cible valide pour le sort');
@@ -303,7 +731,9 @@ export function executerSortJoueur(
       desc = `${persoClone.nom} projette un sortilège sur ${cible.nom} (${jetTotal} vs CA ${cible.ca}) : ${degatsInfliges} dégâts arcaniques.`;
       if (cible.pv === 0) {
         cible.statut = 'MORT';
-        desc += ` ${cible.nom} est anéanti.`;
+        const xpGain = cible.xp || 0;
+        if (xpGain > 0) persoClone.experience += xpGain;
+        desc += xpGain > 0 ? ` ${cible.nom} est anéanti (+${xpGain} XP).` : ` ${cible.nom} est anéanti.`;
       }
       issue = jet.valeurRetenue === 20 ? 'CRITICAL_SUCCESS' : 'SUCCESS';
     } else {
@@ -312,9 +742,9 @@ export function executerSortJoueur(
     }
   }
 
+  combatClone.actionDisponible = false;
   combatClone.journalCombat.push(desc);
 
-  // Vérification fin de combat si tous ennemis morts
   if (!combatClone.ennemis.some(e => e.statut === 'ACTIF')) {
     combatClone.actif = false;
     combatClone.journalCombat.push('Victoire arcanique : zone pacifiée.');
@@ -364,6 +794,7 @@ export function executerFuiteJoueur(
     combatClone.actif = false;
     desc = `${persoClone.nom} se désengage habilement (${total} vs DD ${ddFuite}) et rompt le combat pour se replier.`;
   } else {
+    combatClone.actionDisponible = false;
     desc = `${persoClone.nom} tente de fuir mais trébuche dans les décombres (${total} vs DD ${ddFuite}). L'ennemi bloque la retraite.`;
   }
   combatClone.journalCombat.push(desc);
